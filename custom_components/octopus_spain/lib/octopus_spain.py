@@ -4,6 +4,7 @@ import os
 from typing import Optional
 
 from python_graphql_client import GraphqlClient
+from homeassistant.util import dt as dt_util
 
 GRAPH_QL_ENDPOINT = "https://api.oees-kraken.energy/v1/graphql/"
 SOLAR_WALLET_LEDGER = "SOLAR_WALLET_LEDGER"
@@ -199,24 +200,86 @@ class OctopusSpain:
             for edge in edges
         ]
         return measurements
-    
+
     async def account(self, account: str):
+        # Ensure we're authenticated (mirror logic from hourly_consumption)
+        if self._token is None:
+            if not await self.login():
+                _LOGGER.error(
+                    "Unable to fetch billing info for account %s due to login failure",
+                    account,
+                )
+                return {
+                    'solar_wallet': None,
+                    'octopus_credit': None,
+                    'last_invoice': {
+                        # Primary value and mirrors
+                        'amount': None,
+                        'invoiced_amount': None,
+                        # Totals
+                        'gross_total': None,
+                        'net_total': None,
+                        'tax_total': None,
+                        # Dates and identifiers
+                        'issued': None,
+                        'earliest_charge_at': None,
+                        'pdf': None,
+                        'id': None,
+                        # Legacy fields kept for compatibility
+                        'start': None,
+                        'end': None,
+                    }
+                }
+
+        # --- Helpers: proper timezone-aware conversion ---
+        def _to_local_date_str(iso_str: Optional[str]) -> Optional[str]:
+            """Parse an ISO8601 datetime string and return local date (YYYY-MM-DD).
+
+            - Accepts timezone-aware or naive inputs; naive treated as UTC.
+            - Returns a string for JSON-serializable HA attributes.
+            """
+            if not iso_str:
+                return None
+            try:
+                dt: Optional[datetime] = dt_util.parse_datetime(iso_str)
+                if dt is None:
+                    # Fallback for strict fromisoformat and trailing Z
+                    iso_norm = iso_str.replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(iso_norm)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                dt_local = dt_util.as_local(dt)
+                return dt_local.date().isoformat()
+            except Exception:  # pragma: no cover - robust to any parse edge
+                _LOGGER.debug("Failed to parse datetime '%s' for local date", iso_str, exc_info=True)
+                try:
+                    # Last ditch: return the first 10 chars if it looks like a date
+                    return iso_str[:10]
+                except Exception:
+                    return None
+
         query = """
             query ($account: String!) {
-              accountBillingInfo(accountNumber: $account) {
+              account(accountNumber: $account) {
                 ledgers {
                   ledgerType
-                  statementsWithDetails(first: 1) {
+                  balance
+                  invoices(last: 1) {
                     edges {
                       node {
-                        amount
-                        consumptionStartDate
-                        consumptionEndDate
-                        issuedDate
+                        id
+                        invoicedAmount
+                        earliestChargeAt
+                        firstIssued
+                        pdfUrl
+                        totalCharges {
+                          grossTotal
+                          netTotal
+                          taxTotal
+                        }
                       }
                     }
                   }
-                  balance
                 }
               }
             }
@@ -224,36 +287,93 @@ class OctopusSpain:
         headers = {"authorization": self._token}
         client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
         response = await client.execute_async(query, {"account": account})
-        ledgers = response["data"]["accountBillingInfo"]["ledgers"]
+        ledgers = response.get("data", {}).get("account", {}).get("ledgers", [])
+        if not isinstance(ledgers, list):
+            _LOGGER.error(
+                "Billing info ledgers payload unexpected for account %s: %s",
+                account,
+                type(ledgers).__name__,
+            )
+            ledgers = []
         electricity = next(filter(lambda x: x['ledgerType'] == ELECTRICITY_LEDGER, ledgers), None)
         solar_wallet = next(filter(lambda x: x['ledgerType'] == SOLAR_WALLET_LEDGER, ledgers), {'balance': 0})
 
         if not electricity:
             raise Exception("Electricity ledger not found")
 
-        invoices = electricity["statementsWithDetails"]["edges"]
+        invs = electricity.get("invoices") or {}
+        invoices = invs.get("edges") or []
+
+        try:
+            bal_preview = float(electricity.get("balance")) / 100.0
+        except Exception:
+            bal_preview = None
+        _LOGGER.debug(
+            "Billing ledger for %s: ledgerType=%s balance_eur=%s invoices_edges=%s keys=%s",
+            account,
+            electricity.get('ledgerType'),
+            bal_preview,
+            len(invoices) if isinstance(invoices, list) else 'n/a',
+            list(electricity.keys()),
+        )
 
         if len(invoices) == 0:
             return {
                 'solar_wallet': None,
                 'last_invoice': {
+                    # Primary value and mirrors
                     'amount': None,
+                    'invoiced_amount': None,
+                    # Totals
+                    'gross_total': None,
+                    'net_total': None,
+                    'tax_total': None,
+                    # Dates and identifiers
                     'issued': None,
+                    'earliest_charge_at': None,
+                    'pdf': None,
+                    'id': None,
+                    # Legacy fields kept for compatibility
                     'start': None,
-                    'end': None
+                    'end': None,
                 }
             }
 
-        invoice = invoices[0]["node"]
+        invoice = invoices[0].get("node", {}) if isinstance(invoices[0], dict) else {}
 
         # Los timedelta son bastante chapuzas, habrá que arreglarlo
+        # Parse monetary values (API returns cents) and dates
+        invoiced_amount_cents = invoice.get("invoicedAmount")
+        charges = invoice.get("totalCharges") or {}
+        gross_cents = charges.get("grossTotal")
+        net_cents = charges.get("netTotal")
+        tax_cents = charges.get("taxTotal")
+
+        def cents_to_eur(value):
+            try:
+                return float(value) / 100 if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        def parse_iso_date(value: Optional[str]) -> Optional[str]:
+            # Keep name for compatibility but use timezone-aware local conversion
+            return _to_local_date_str(value)
+
         return {
-            "solar_wallet": (float(solar_wallet["balance"]) / 100),
-            "octopus_credit": (float(electricity["balance"]) / 100),
+            "solar_wallet": (float(solar_wallet.get("balance", 0)) / 100),
+            "octopus_credit": (float(electricity.get("balance", 0)) / 100),
             "last_invoice": {
-                "amount": invoice["amount"] if invoice["amount"] else 0,
-                "issued": datetime.fromisoformat(invoice["issuedDate"]).date(),
-                "start": (datetime.fromisoformat(invoice["consumptionStartDate"]) + timedelta(hours=2)).date(),
-                "end": (datetime.fromisoformat(invoice["consumptionEndDate"]) - timedelta(seconds=1)).date(),
+                # State (euros): prefer invoicedAmount as the main amount
+                "amount": cents_to_eur(gross_cents),
+                # New fields from invoices API (euros)
+                "invoiced_amount": cents_to_eur(invoiced_amount_cents),
+                "gross_total": cents_to_eur(gross_cents),
+                "net_total": cents_to_eur(net_cents),
+                "tax_total": cents_to_eur(tax_cents),
+                # Dates (parsed to date)
+                "issued": parse_iso_date(invoice.get("firstIssued")),
+                "earliest_charge_at": parse_iso_date(invoice.get("earliestChargeAt")),
+                "pdf": invoice.get("pdfUrl"),
+                "id": invoice.get("id"),
             },
         }

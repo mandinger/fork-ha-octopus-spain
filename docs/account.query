@@ -1,0 +1,32 @@
+query Account {
+  account(accountNumber: "") {
+    ledgers {
+      ledgerType
+      invoices(last: 1) {
+        edges {
+          node {
+            totalCharges {
+              grossTotal
+              netTotal
+              taxTotal
+            }
+            invoicedAmount
+            id
+            earliestChargeAt
+            firstIssued
+            pdfUrl
+          }
+        }
+      }
+    }
+    payments(first: 1) {
+      edges {
+        node {
+          amount
+          id
+          paymentDate
+        }
+      }
+    }
+  }
+}
