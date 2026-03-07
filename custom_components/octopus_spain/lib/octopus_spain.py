@@ -364,7 +364,7 @@ class OctopusSpain:
             "octopus_credit": (float(electricity.get("balance", 0)) / 100),
             "last_invoice": {
                 # State (euros): prefer invoicedAmount as the main amount
-                "amount": cents_to_eur(invoiced_amount_cents),
+                "amount": cents_to_eur(gross_cents),
                 # New fields from invoices API (euros)
                 "invoiced_amount": cents_to_eur(invoiced_amount_cents),
                 "gross_total": cents_to_eur(gross_cents),
