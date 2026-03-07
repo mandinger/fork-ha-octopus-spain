@@ -21,14 +21,14 @@ Este componente ha sido revisado por los ingenerios de _Octopus Energy_ y ha rec
 Puedes instalar el componente usando HACS:
 
 ### Directa usando _My Home Assistant_
-[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=mandinger&repository=ha-octopus-spain&category=integration)
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=mandinger&repository=fork-ha-octopus-spain&category=integration)
 
 
 ### Manual
 ```
 HACS -> Integraciones -> Tres puntitos -> Repositorios Personalizados
 ```
-Copias la URL del repositorio ( https://github.com/mandinger/ha-octopus-spain ), como categoría seleccionas _Integración_ y pulsas en _Añadir_.
+Copias la URL del repositorio ( https://github.com/mandinger/fork-ha-octopus-spain ), como categoría seleccionas _Integración_ y pulsas en _Añadir_.
 
 
 ## Configuración

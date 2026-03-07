@@ -1,11 +1,12 @@
 {
   "domain": "octopus_spain",
   "name": "Octopus Spain",
-  "codeowners": ["@miguelangellv"],
+  "after_dependencies": ["recorder"],
+  "codeowners": ["@mandinger"],
   "config_flow": true,
-  "documentation": "https://github.com/MiguelAngelLV/octopus_spain",
+  "documentation": "https://github.com/mandinger/fork-ha-octopus-spain",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/MiguelAngelLV/issues",
+  "issue_tracker": "https://github.com/mandinger/fork-ha-octopus-spain/issues",
   "requirements": ["python-graphql-client==0.4.3"],
-  "version": "0.1.0"
+  "version": "0.1.1"
 }

@@ -1,6 +1,6 @@
 {
-    "name": "Octopus Spain",
+    "name": "Octopus Spain Fork",
     "render_readme": true,
-    "homeassistant": "2025.10.3",
+    "homeassistant": "2026.3.1",
     "country":"ES"
 }
