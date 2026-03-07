@@ -132,14 +132,69 @@ class OctopusInvoice(CoordinatorEntity[OctopusCoordinator], SensorEntity):
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        data = self.coordinator.data[self._account]['last_invoice']
-        self._state = data['amount']
-        self._attrs = {
-            'Inicio': data['start'],
-            'Fin': data['end'],
-            'Emitida': data['issued']
-        }
-        self.async_write_ha_state()
+        prefix = f"OctopusInvoice[{self._account}]"
+        try:
+            account_data = self.coordinator.data.get(self._account)
+            if not account_data:
+                _LOGGER.debug("%s: no account data available yet", prefix)
+                self._state = None
+                self._attrs = {}
+                self.async_write_ha_state()
+                return
+
+            inv = account_data.get('last_invoice')
+            if not inv:
+                _LOGGER.debug("%s: 'last_invoice' not present in coordinator data", prefix)
+                self._state = None
+                self._attrs = {}
+                self.async_write_ha_state()
+                return
+
+            # Determine the best amount field to use for state
+            amount = (
+                inv.get('amount')
+                if inv.get('amount') is not None
+                else inv.get('invoiced_amount')
+                if inv.get('invoiced_amount') is not None
+                else inv.get('gross_total')
+            )
+            # Coerce to float when possible; leave as None if missing
+            try:
+                self._state = float(amount) if amount is not None else None
+            except (TypeError, ValueError):
+                _LOGGER.debug("%s: invalid amount value on invoice: %s", prefix, amount)
+                self._state = None
+
+            # Attributes: ensure they are JSON-serializable (strings)
+            def _to_str(v: Any) -> Any:
+                if v is None:
+                    return None
+                return v.isoformat() if hasattr(v, 'isoformat') else str(v)
+
+            self._attrs = {
+                # Legacy fields if still present
+                'Inicio': _to_str(inv.get('start')),
+                'Fin': _to_str(inv.get('end')),
+                # New API fields
+                'Emitida': _to_str(inv.get('first_issued') or inv.get('issued')),
+                'Inicio cargos': _to_str(inv.get('earliest_charge_at')),
+                'Total bruto': inv.get('gross_total'),
+                'Total neto': inv.get('net_total'),
+                'Impuestos': inv.get('tax_total'),
+                'Importe facturado': inv.get('invoiced_amount'),
+                'ID': inv.get('id'),
+                'PDF': inv.get('pdf'),
+            }
+
+            _LOGGER.debug(
+                "%s: updated invoice state amount=%s attrs=%s",
+                prefix,
+                self._state,
+                self._attrs,
+            )
+            self.async_write_ha_state()
+        except Exception as err:  # pragma: no cover - defensive guard
+            _LOGGER.exception("%s: error processing invoice update: %s", prefix, err)
 
     @property
     def native_value(self) -> StateType:
@@ -294,40 +349,39 @@ class OctopusConsumptionStatisticsImporter:
             skipped_additional_missing = 0
 
             if fetch_start_day <= today_utc:
-                day_cursor = fetch_start_day
-                while day_cursor <= today_utc:
-                    day_start = datetime.combine(day_cursor, time.min, dt_util.UTC)
-                    day_end = day_start + timedelta(days=1)
-                    fetched_days.append(day_cursor)
-                    fetched = await self._coordinator.async_fetch_hourly_consumption(
-                        self._account,
-                        day_start,
-                        day_end,
+                # Batch fetch in a single request to reduce API calls and avoid rate limits
+                range_start = datetime.combine(fetch_start_day, time.min, dt_util.UTC)
+                range_end = datetime.combine(today_utc + timedelta(days=1), time.min, dt_util.UTC)
+                fetched_days.append(fetch_start_day)
+                fetched = await self._coordinator.async_fetch_hourly_consumption(
+                    self._account,
+                    range_start,
+                    range_end,
+                )
+                if not fetched:
+                    _LOGGER.debug(
+                        "%s: fetched 0 measurements for range %s..%s",
+                        prefix,
+                        fetch_start_day,
+                        today_utc,
                     )
-                    if not fetched:
-                        _LOGGER.debug(
-                            "%s: fetched 0 measurements for day %s",
-                            prefix,
-                            day_cursor,
-                        )
-                    else:
-                        additional_count += len(fetched)
-                        for item in fetched:
-                            start_at = item.get("startAt")
-                            if not start_at:
-                                skipped_additional_missing += 1
-                                continue
-                            start_utc = _parse_dt(start_at)
-                            if start_utc is None:
-                                skipped_additional_unparsed += 1
-                                continue
-                            if start_utc < keep_from_utc:
-                                continue
-                            measurements_by_start[start_utc] = item
-                    day_cursor += timedelta(days=1)
+                else:
+                    additional_count += len(fetched)
+                    for item in fetched:
+                        start_at = item.get("startAt")
+                        if not start_at:
+                            skipped_additional_missing += 1
+                            continue
+                        start_utc = _parse_dt(start_at)
+                        if start_utc is None:
+                            skipped_additional_unparsed += 1
+                            continue
+                        if start_utc < keep_from_utc:
+                            continue
+                        measurements_by_start[start_utc] = item
             else:
                 _LOGGER.debug(
-                    "%s: no additional days to fetch (fetch_start_day=%s today=%s)",
+                    "%s: no additional range to fetch (fetch_start_day=%s today=%s)",
                     prefix,
                     fetch_start_day,
                     today_utc,
