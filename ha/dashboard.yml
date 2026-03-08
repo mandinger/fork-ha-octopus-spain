@@ -1,0 +1,42 @@
+views:
+  - type: sections
+    sections:
+      - type: grid
+        cards:
+          - type: tile
+            entity: sensor.ultima_factura_octopus
+          - type: tile
+            entity: sensor.factura_impuestos
+          - type: tile
+            entity: sensor.factura_emitida
+          - type: tile
+            entity: sensor.factura_id
+          - type: tile
+            entity: sensor.factura_importe_facturado
+          - type: tile
+            entity: sensor.factura_impuestos
+          - type: tile
+            entity: sensor.factura_inicio_cargos
+          - type: markdown
+            content: |-
+              <h3>
+              <a href="{{ state_attr('sensor.factura_pdf', 'url') }}">
+              <ha-icon icon="mdi:file-pdf-box"></ha-icon>Factura: Pdf
+              </a>
+              </h3>
+            grid_options:
+              columns: 5
+              rows: 1.1
+          - type: tile
+            entity: sensor.factura_total_bruto
+          - type: tile
+            entity: sensor.factura_total_neto
+        column_span: 2
+    max_columns: 4
+    title: Main
+    cards: []
+    header:
+      card:
+        type: markdown
+        text_only: true
+        content: '# Hello {{ user }}'
