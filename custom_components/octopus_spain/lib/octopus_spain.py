@@ -320,6 +320,7 @@ class OctopusSpain:
         if len(invoices) == 0:
             return {
                 'solar_wallet': None,
+                'octopus_credit': None,
                 'last_invoice': {
                     # Primary value and mirrors
                     'amount': None,
