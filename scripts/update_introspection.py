@@ -25,6 +25,8 @@ DEFAULT_OUTPUT = Path("docs/InstrospectionQuery.json")
 DEFAULT_QUERY_FILE = Path("docs/introspection.full.query")
 DEFAULT_ENDPOINT = "https://api.oees-kraken.energy/v1/graphql/"
 DEFAULT_DOCS_DIR = Path(".codex/graphql")
+DEFAULT_HELPERS_OUTPUT = Path("custom_components/octopus_spain/lib/graphql_helpers/generated.py")
+DEFAULT_OPERATIONS_DIR = Path("graphql/operations")
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,6 +103,26 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_DOCS_DIR,
         help=f"Docs output directory used with --generate-docs. Default: {DEFAULT_DOCS_DIR}",
+    )
+    parser.add_argument(
+        "--generate-helpers",
+        action="store_true",
+        help=(
+            "Also generate typed GraphQL helper DTOs/request-builders from introspection "
+            "and graphql/operations/*.graphql."
+        ),
+    )
+    parser.add_argument(
+        "--helpers-out",
+        type=Path,
+        default=DEFAULT_HELPERS_OUTPUT,
+        help=f"Helpers output file used with --generate-helpers. Default: {DEFAULT_HELPERS_OUTPUT}",
+    )
+    parser.add_argument(
+        "--operations-dir",
+        type=Path,
+        default=DEFAULT_OPERATIONS_DIR,
+        help=f"Operations directory used with --generate-helpers. Default: {DEFAULT_OPERATIONS_DIR}",
     )
     return parser.parse_args()
 
@@ -223,6 +245,34 @@ def main() -> int:
             if result.returncode != 0:
                 print(
                     f"Warning: docs generator exited with code {result.returncode}.",
+                    file=sys.stderr,
+                )
+                return result.returncode
+
+    if args.generate_helpers:
+        script_path = Path(__file__).with_name("generate_graphql_helpers.py")
+        if not script_path.exists():
+            print(
+                f"Warning: helpers generator not found at {script_path}. Skipping helper generation.",
+                file=sys.stderr,
+            )
+        else:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script_path),
+                    "--introspection",
+                    str(args.output),
+                    "--operations-dir",
+                    str(args.operations_dir),
+                    "--output",
+                    str(args.helpers_out),
+                ],
+                check=False,
+            )
+            if result.returncode != 0:
+                print(
+                    f"Warning: helpers generator exited with code {result.returncode}.",
                     file=sys.stderr,
                 )
                 return result.returncode
