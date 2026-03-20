@@ -1,0 +1,30 @@
+query getMeasurements(
+  $account: String!
+  $startAt: DateTime!
+  $endAt: DateTime!
+  $utilityFilters: [UtilityFiltersInput!]
+) {
+  account(accountNumber: $account) {
+    properties {
+      id
+      measurements(
+        first: 1500
+        utilityFilters: $utilityFilters
+        startAt: $startAt
+        endAt: $endAt
+        timezone: "Etc/GMT"
+      ) {
+        edges {
+          node {
+            value
+            unit
+            ... on IntervalMeasurementType {
+              startAt
+              endAt
+            }
+          }
+        }
+      }
+    }
+  }
+}
