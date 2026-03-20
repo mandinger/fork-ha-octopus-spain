@@ -96,7 +96,33 @@ class OctopusSpain:
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
     ):
+        return await self._consumption(
+            account=account,
+            reading_frequency_type="HOUR_INTERVAL",
+            start=start,
+            end=end,
+        )
 
+    async def daily_consumption(
+        self,
+        account: str,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ):
+        return await self._consumption(
+            account=account,
+            reading_frequency_type="DAY_INTERVAL",
+            start=start,
+            end=end,
+        )
+
+    async def _consumption(
+        self,
+        account: str,
+        reading_frequency_type: str,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ):
         query = """
             query getMeasurements(
                 $account: String!,
@@ -133,7 +159,8 @@ class OctopusSpain:
         if self._token is None:
             if not await self.login():
                 _LOGGER.error(
-                    "Unable to fetch hourly consumption for account %s due to login failure",
+                    "Unable to fetch %s consumption for account %s due to login failure",
+                    reading_frequency_type.lower(),
                     account,
                 )
                 return []
@@ -156,7 +183,8 @@ class OctopusSpain:
 
         if start_local >= end_local:
             _LOGGER.debug(
-                "Skipping hourly consumption request for account %s because start %s >= end %s",
+                "Skipping %s consumption request for account %s because start %s >= end %s",
+                reading_frequency_type.lower(),
                 account,
                 start_local,
                 end_local,
@@ -168,25 +196,35 @@ class OctopusSpain:
 
         def to_utc_iso_z(dt: datetime) -> str:
             return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
         variables = {
             "account": account,
             "startAt": to_utc_iso_z(start_utc),
             "endAt": to_utc_iso_z(end_utc),
-            "utilityFilters":[{"electricityFilters": {"readingDirection": "CONSUMPTION","readingFrequencyType": "HOUR_INTERVAL"}}]
+            "utilityFilters": [
+                {
+                    "electricityFilters": {
+                        "readingDirection": "CONSUMPTION",
+                        "readingFrequencyType": reading_frequency_type,
+                    }
+                }
+            ],
         }
         headers = {"authorization": self._token}
         client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
         response = await client.execute_async(query, variables)
         if "errors" in response:
             _LOGGER.error(
-                "GraphQL errors while fetching hourly consumption for account %s: %s",
+                "GraphQL errors while fetching %s consumption for account %s: %s",
+                reading_frequency_type.lower(),
                 account,
                 response["errors"],
             )
             return []
 
         _LOGGER.debug(
-            "Hourly consumption query for account %s executed. Start=%s End=%s",
+            "%s consumption query for account %s executed. Start=%s End=%s",
+            reading_frequency_type,
             account,
             variables["startAt"],
             variables["endAt"],
@@ -195,7 +233,8 @@ class OctopusSpain:
         props = response.get("data", {}).get("account", {}).get("properties", [])
         if not props:
             _LOGGER.warning(
-                "No properties returned in hourly consumption response for account %s",
+                "No properties returned in %s consumption response for account %s",
+                reading_frequency_type.lower(),
                 account,
             )
             return []
@@ -203,32 +242,36 @@ class OctopusSpain:
             edges = props[0]["measurements"]["edges"]
         except (KeyError, IndexError, TypeError) as err:
             _LOGGER.error(
-                "Unexpected hourly consumption response format for account %s: %s",
+                "Unexpected %s consumption response format for account %s: %s",
+                reading_frequency_type.lower(),
                 account,
                 err,
             )
             _LOGGER.debug(
-                "Hourly consumption raw response for account %s: %s", account, response
+                "%s consumption raw response for account %s: %s",
+                reading_frequency_type,
+                account,
+                response,
             )
             return []
 
         if not edges:
             _LOGGER.debug(
-                "Hourly consumption response returned 0 measurements for account %s",
+                "%s consumption response returned 0 measurements for account %s",
+                reading_frequency_type,
                 account,
             )
             return []
 
-        measurements = [
+        return [
             {
                 "value": edge["node"]["value"],
                 "unit": edge["node"]["unit"],
-                "startAt": edge["node"]["startAt"],
-                "endAt": edge["node"]["endAt"],
+                "startAt": edge["node"].get("startAt"),
+                "endAt": edge["node"].get("endAt"),
             }
             for edge in edges
         ]
-        return measurements
 
     async def account(self, account: str):
         # Ensure we're authenticated (mirror logic from hourly_consumption)
