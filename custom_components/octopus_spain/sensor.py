@@ -411,6 +411,8 @@ class OctopusConsumptionStatisticsImporter:
         self._statistic_id = f"{DOMAIN}:energy_consumption_{safe_account}"
         self._name = "Consumo Electrico" if single else f"Consumo Electrico ({account})"
         self._remove_listener: Callable[[], None] | None = None
+        self._reconcile_warning_fingerprint_by_day: dict[date, tuple[int, float, float]] = {}
+        self._negative_consumption_fingerprints: set[str] = set()
 
     async def async_setup(self) -> None:
         """Run an initial sync and subscribe to coordinator updates."""
@@ -426,6 +428,451 @@ class OctopusConsumptionStatisticsImporter:
     def _schedule_update(self) -> None:
         """Schedule processing for the latest coordinator data."""
         self._hass.async_create_task(self._async_process_update())
+
+    @staticmethod
+    def _parse_stat_start(value: Any) -> datetime | None:
+        if isinstance(value, (int, float)):
+            return dt_util.utc_from_timestamp(value)
+        if isinstance(value, str):
+            parsed = dt_util.parse_datetime(value)
+            if parsed is not None:
+                return dt_util.as_utc(parsed)
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=dt_util.UTC)
+            return dt_util.as_utc(value)
+        return None
+
+    def _parse_non_negative_kwh(self, raw_value: Any, *, prefix: str, label: str) -> float | None:
+        try:
+            value = float(Decimal(raw_value))
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+
+        if value < 0:
+            fingerprint = f"{label}:{value:.6f}"
+            if fingerprint not in self._negative_consumption_fingerprints:
+                self._negative_consumption_fingerprints.add(fingerprint)
+                _LOGGER.warning(
+                    "%s: negative consumption ignored at %s (value=%.6f kWh)",
+                    prefix,
+                    label,
+                    value,
+                )
+            return None
+        return value
+
+    async def _async_add_statistics(self, metadata: dict[str, Any], statistics: list[dict[str, Any]]) -> None:
+        if not statistics:
+            return
+        if iscoroutinefunction(async_add_external_statistics):
+            await async_add_external_statistics(self._hass, metadata, statistics)
+        else:
+            await self._hass.async_add_executor_job(
+                async_add_external_statistics, self._hass, metadata, statistics
+            )
+
+    async def _async_reconcile_current_month(
+        self,
+        *,
+        prefix: str,
+        metadata: dict[str, Any],
+        today_utc: date,
+    ) -> None:
+        month_start_day = today_utc.replace(day=1)
+        complete_until = today_utc - timedelta(days=1)
+        if complete_until < month_start_day:
+            return
+
+        range_start = datetime.combine(month_start_day, time.min, dt_util.UTC)
+        range_end = datetime.combine(complete_until + timedelta(days=1), time.min, dt_util.UTC)
+        daily_rows = await self._coordinator.async_fetch_daily_consumption(
+            self._account,
+            range_start,
+            range_end,
+        )
+        if not daily_rows:
+            _LOGGER.debug("%s: monthly reconcile daily pull returned no rows", prefix)
+            return
+
+        daily_by_day: dict[date, float] = {}
+        for row in daily_rows:
+            start_at = row.get("startAt")
+            if not isinstance(start_at, str):
+                continue
+            parsed_start = dt_util.parse_datetime(start_at)
+            if parsed_start is None:
+                continue
+            day = dt_util.as_utc(parsed_start).date()
+            if day < month_start_day or day > complete_until:
+                continue
+            parsed_daily = self._parse_non_negative_kwh(
+                row.get("value"),
+                prefix=prefix,
+                label=f"daily:{day.isoformat()}",
+            )
+            if parsed_daily is None:
+                continue
+            daily_by_day[day] = parsed_daily
+
+        if not daily_by_day:
+            _LOGGER.debug("%s: monthly reconcile has no comparable daily totals", prefix)
+            return
+
+        stats_window = ((complete_until.day + 2) * 24) + 48
+        existing = await get_instance(self._hass).async_add_executor_job(
+            get_last_statistics,
+            self._hass,
+            stats_window,
+            self._statistic_id,
+            True,
+            {STATISTIC_SUM},
+        )
+        existing_points_raw = existing.get(self._statistic_id, [])
+        existing_points: list[tuple[datetime, float]] = []
+        existing_by_start: dict[datetime, float] = {}
+        for point in existing_points_raw:
+            parsed_start = self._parse_stat_start(point.get("start"))
+            if parsed_start is None:
+                continue
+            raw_sum = point.get("sum")
+            if raw_sum is None:
+                raw_sum = point.get("state")
+            try:
+                parsed_sum = float(raw_sum)
+            except (TypeError, ValueError):
+                continue
+            existing_points.append((parsed_start, parsed_sum))
+            existing_by_start[parsed_start] = parsed_sum
+        existing_points.sort(key=lambda item: item[0])
+
+        tolerance_kwh = 0.05
+        reconciled_days = 0
+
+        for day in sorted(daily_by_day):
+            day_start = datetime.combine(day, time.min, dt_util.UTC)
+            day_end = day_start + timedelta(days=1)
+
+            prev_sum = 0.0
+            day_last_sum: float | None = None
+            day_hours_seen = 0
+            for point_start, point_sum in existing_points:
+                if point_start < day_start:
+                    prev_sum = point_sum
+                    continue
+                if point_start >= day_end:
+                    break
+                day_last_sum = point_sum
+                day_hours_seen += 1
+
+            stored_day_total = None if day_last_sum is None else (day_last_sum - prev_sum)
+            api_day_total = daily_by_day[day]
+            delta = None if stored_day_total is None else (stored_day_total - api_day_total)
+
+            needs_reconcile = (
+                stored_day_total is None
+                or day_hours_seen < 24
+                or (delta is not None and abs(delta) > tolerance_kwh)
+            )
+            if not needs_reconcile:
+                continue
+
+            updated = await self._async_reconcile_day_from_hourly(
+                prefix=prefix,
+                metadata=metadata,
+                day=day,
+                api_day_total=api_day_total,
+                existing_by_start=existing_by_start,
+                existing_points=existing_points,
+                tolerance_kwh=tolerance_kwh,
+            )
+            if updated:
+                reconciled_days += 1
+
+        if reconciled_days:
+            _LOGGER.info(
+                "%s: monthly reconcile updated statistics for %s day(s)",
+                prefix,
+                reconciled_days,
+            )
+        else:
+            _LOGGER.debug("%s: monthly reconcile found no updatable mismatches", prefix)
+
+    async def _async_reconcile_day_from_hourly(
+        self,
+        *,
+        prefix: str,
+        metadata: dict[str, Any],
+        day: date,
+        api_day_total: float,
+        existing_by_start: dict[datetime, float],
+        existing_points: list[tuple[datetime, float]],
+        tolerance_kwh: float,
+    ) -> bool:
+        day_start = datetime.combine(day, time.min, dt_util.UTC)
+        day_end = day_start + timedelta(days=1)
+        hourly_rows = await self._coordinator.async_fetch_hourly_consumption(
+            self._account,
+            day_start,
+            day_end,
+        )
+        if not hourly_rows:
+            _LOGGER.warning(
+                "%s: reconcile day %s skipped, hourly pull returned 0 rows",
+                prefix,
+                day.isoformat(),
+            )
+            return False
+
+        hourly_values: dict[datetime, float] = {}
+        for row in hourly_rows:
+            start_at = row.get("startAt")
+            if not isinstance(start_at, str):
+                continue
+            parsed = dt_util.parse_datetime(start_at)
+            if parsed is None:
+                continue
+            start_utc = dt_util.as_utc(parsed)
+            parsed_hourly = self._parse_non_negative_kwh(
+                row.get("value"),
+                prefix=prefix,
+                label=f"hourly:{start_utc.isoformat()}",
+            )
+            if parsed_hourly is None:
+                continue
+            hourly_values[start_utc] = parsed_hourly
+
+        if not hourly_values:
+            _LOGGER.warning(
+                "%s: reconcile day %s skipped, no parseable hourly rows",
+                prefix,
+                day.isoformat(),
+            )
+            return False
+
+        present_hours = {dt.hour for dt in hourly_values}
+        missing_hours = sorted(set(range(24)) - present_hours)
+        hourly_total = sum(hourly_values.values())
+        if missing_hours and abs(api_day_total - hourly_total) <= tolerance_kwh:
+            for hour in missing_hours:
+                hourly_values[day_start + timedelta(hours=hour)] = 0.0
+            _LOGGER.debug(
+                "%s: reconcile day %s filled %s missing hourly interval(s) with 0.0 kWh because daily total matches",
+                prefix,
+                day.isoformat(),
+                len(missing_hours),
+            )
+
+        baseline_sum = 0.0
+        for point_start, point_sum in existing_points:
+            if point_start < day_start:
+                baseline_sum = point_sum
+            else:
+                break
+
+        running = baseline_sum
+        day_statistics: list[dict[str, Any]] = []
+        mismatch_count = 0
+        max_abs_delta = 0.0
+        first_mismatch_start: datetime | None = None
+        for hour in range(24):
+            slot_start = day_start + timedelta(hours=hour)
+            if slot_start not in hourly_values:
+                continue
+            running += hourly_values[slot_start]
+            existing_sum = existing_by_start.get(slot_start)
+            if existing_sum is None:
+                day_statistics.append(
+                    {
+                        "start": slot_start,
+                        "state": running,
+                        "sum": running,
+                    }
+                )
+            elif abs(existing_sum - running) > tolerance_kwh:
+                mismatch_count += 1
+                point_abs_delta = abs(existing_sum - running)
+                if point_abs_delta > max_abs_delta:
+                    max_abs_delta = point_abs_delta
+                if first_mismatch_start is None:
+                    first_mismatch_start = slot_start
+
+        if mismatch_count:
+            # Avoid repeating exactly the same warning fingerprint on every refresh.
+            fingerprint = (mismatch_count, round(max_abs_delta, 3), round(api_day_total, 3))
+            last_fingerprint = self._reconcile_warning_fingerprint_by_day.get(day)
+            if last_fingerprint != fingerprint:
+                self._reconcile_warning_fingerprint_by_day[day] = fingerprint
+                _LOGGER.warning(
+                    "%s: reconcile day %s found %s existing statistic mismatch(es), first=%s, max_delta=%.3f kWh. Existing points are not overwritten.",
+                    prefix,
+                    day.isoformat(),
+                    mismatch_count,
+                    first_mismatch_start.isoformat() if first_mismatch_start else "n/a",
+                    max_abs_delta,
+                )
+            else:
+                _LOGGER.debug(
+                    "%s: reconcile day %s mismatch fingerprint unchanged (%s mismatch(es), max_delta=%.3f kWh), suppressing repeated warning",
+                    prefix,
+                    day.isoformat(),
+                    mismatch_count,
+                    max_abs_delta,
+                )
+
+        if not day_statistics:
+            return False
+
+        await self._async_add_statistics(metadata, day_statistics)
+        for point in day_statistics:
+            start = point["start"]
+            sum_value = point["sum"]
+            existing_by_start[start] = sum_value
+            existing_points.append((start, sum_value))
+        existing_points.sort(key=lambda item: item[0])
+        _LOGGER.info(
+            "%s: reconcile day %s added %s missing statistics point(s)",
+            prefix,
+            day.isoformat(),
+            len(day_statistics),
+        )
+        return True
+
+    async def _async_compare_hourly_vs_daily(
+        self,
+        *,
+        prefix: str,
+        measurements_by_start: dict[datetime, Any],
+        today_utc: date,
+    ) -> None:
+        """Compare hourly-summed totals with API daily totals for diagnostics."""
+        if not measurements_by_start:
+            return
+
+        # We diagnose a recent complete window to avoid noisy partial-day mismatches.
+        complete_until = today_utc - timedelta(days=1)
+        compare_days = 7
+        compare_start_day = complete_until - timedelta(days=compare_days - 1)
+        if compare_start_day > complete_until:
+            return
+
+        hourly_by_day: dict[date, float] = {}
+        hours_seen_by_day: dict[date, set[int]] = {}
+        for start_utc, item in measurements_by_start.items():
+            day = start_utc.date()
+            if day < compare_start_day or day > complete_until:
+                continue
+            val = self._parse_non_negative_kwh(
+                item.get("value"),
+                prefix=prefix,
+                label=f"seed-hourly:{start_utc.isoformat()}",
+            )
+            if val is None:
+                continue
+            hourly_by_day[day] = hourly_by_day.get(day, 0.0) + val
+            hours_seen_by_day.setdefault(day, set()).add(start_utc.hour)
+
+        if not hourly_by_day:
+            return
+
+        range_start = datetime.combine(compare_start_day, time.min, dt_util.UTC)
+        range_end = datetime.combine(complete_until + timedelta(days=1), time.min, dt_util.UTC)
+        daily_rows = await self._coordinator.async_fetch_daily_consumption(
+            self._account,
+            range_start,
+            range_end,
+        )
+
+        def _parse_start_at(value: Any) -> datetime | None:
+            if not isinstance(value, str):
+                return None
+            parsed = dt_util.parse_datetime(value)
+            if parsed is None:
+                return None
+            return dt_util.as_utc(parsed)
+
+        daily_by_day: dict[date, float] = {}
+        for row in daily_rows:
+            start_at = _parse_start_at(row.get("startAt"))
+            if start_at is None:
+                continue
+            day = start_at.date()
+            if day < compare_start_day or day > complete_until:
+                continue
+            parsed_daily = self._parse_non_negative_kwh(
+                row.get("value"),
+                prefix=prefix,
+                label=f"diag-daily:{day.isoformat()}",
+            )
+            if parsed_daily is None:
+                continue
+            daily_by_day[day] = parsed_daily
+
+        if not daily_by_day:
+            _LOGGER.debug("%s: daily diagnostic returned 0 comparable rows", prefix)
+            return
+
+        tolerance_kwh = 0.05
+        for day in sorted(hourly_by_day):
+            hourly_total = hourly_by_day[day]
+            daily_total = daily_by_day.get(day)
+            seen_hours = hours_seen_by_day.get(day, set())
+            hours_seen = len(seen_hours)
+            missing_hours = sorted(set(range(24)) - seen_hours)
+            has_missing_hours = hours_seen < 24
+
+            if daily_total is None:
+                if has_missing_hours:
+                    _LOGGER.warning(
+                        "%s: missing hourly intervals for %s (hours_seen=%s/24, missing_hours=%s, hourly_total=%.3f kWh)",
+                        prefix,
+                        day.isoformat(),
+                        hours_seen,
+                        missing_hours,
+                        hourly_total,
+                    )
+                _LOGGER.warning(
+                    "%s: no daily value returned for %s while hourly data exists (hourly_total=%.3f kWh)",
+                    prefix,
+                    day.isoformat(),
+                    hourly_total,
+                )
+                continue
+
+            delta = hourly_total - daily_total
+            if abs(delta) > tolerance_kwh:
+                _LOGGER.warning(
+                    "%s: hourly/daily mismatch on %s (hourly=%.3f kWh, daily=%.3f kWh, delta=%.3f kWh, hours_seen=%s/24, missing_hours=%s)",
+                    prefix,
+                    day.isoformat(),
+                    hourly_total,
+                    daily_total,
+                    delta,
+                    hours_seen,
+                    missing_hours,
+                )
+            else:
+                if has_missing_hours:
+                    _LOGGER.debug(
+                        "%s: hourly/daily aligned on %s despite missing intervals (hours_seen=%s/24, missing_hours=%s, hourly=%.3f kWh, daily=%.3f kWh, delta=%.3f kWh)",
+                        prefix,
+                        day.isoformat(),
+                        hours_seen,
+                        missing_hours,
+                        hourly_total,
+                        daily_total,
+                        delta,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "%s: hourly/daily aligned on %s (hourly=%.3f kWh, daily=%.3f kWh, delta=%.3f kWh)",
+                        prefix,
+                        day.isoformat(),
+                        hourly_total,
+                        daily_total,
+                        delta,
+                    )
 
     async def _async_process_update(self) -> None:
         prefix = f"OctopusConsumptionStats[{self._account}]"
@@ -596,6 +1043,13 @@ class OctopusConsumptionStatisticsImporter:
                 )
                 return
 
+            # Diagnostic-only comparison to help identify discrepancies with official app totals.
+            await self._async_compare_hourly_vs_daily(
+                prefix=prefix,
+                measurements_by_start=measurements_by_start,
+                today_utc=today_utc,
+            )
+
             metadata = {
                 "mean_type": 0,
                 "has_sum": True,
@@ -606,6 +1060,41 @@ class OctopusConsumptionStatisticsImporter:
                 "unit_class": None,
             }
             _LOGGER.debug("%s: filled metadata statistics metadata=%s", prefix, metadata)
+
+            await self._async_reconcile_current_month(
+                prefix=prefix,
+                metadata=metadata,
+                today_utc=today_utc,
+            )
+
+            # Re-read tail statistics in case monthly reconcile inserted points.
+            last_after_reconcile = await get_instance(self._hass).async_add_executor_job(
+                get_last_statistics,
+                self._hass,
+                1,
+                self._statistic_id,
+                True,
+                {STATISTIC_SUM},
+            )
+            last_points_after = last_after_reconcile.get(self._statistic_id) or []
+            if last_points_after:
+                last_point = last_points_after[-1]
+                parsed_start = self._parse_stat_start(last_point.get("start"))
+                if parsed_start is not None:
+                    last_start = parsed_start
+                raw_sum = last_point.get("sum")
+                if raw_sum is None:
+                    raw_sum = last_point.get("state")
+                try:
+                    last_sum = float(raw_sum or 0.0)
+                except (TypeError, ValueError):
+                    pass
+                _LOGGER.debug(
+                    "%s: tail statistics refreshed after reconcile start=%s sum=%s",
+                    prefix,
+                    last_start,
+                    last_sum,
+                )
 
             sorted_meas = sorted(measurements_by_start.items(), key=lambda item: item[0])
             _LOGGER.debug("%s: sorted measurements count=%s", prefix, len(sorted_meas))
@@ -620,9 +1109,12 @@ class OctopusConsumptionStatisticsImporter:
                     skipped_already_imported += 1
                     continue
 
-                try:
-                    val = float(Decimal(m["value"]))
-                except (InvalidOperation, ValueError, TypeError):
+                val = self._parse_non_negative_kwh(
+                    m.get("value"),
+                    prefix=prefix,
+                    label=f"import-hourly:{start_utc.isoformat()}",
+                )
+                if val is None:
                     skipped_invalid_value += 1
                     continue
 
@@ -656,12 +1148,7 @@ class OctopusConsumptionStatisticsImporter:
                     metadata,
                     statistics,
                 )
-                if iscoroutinefunction(async_add_external_statistics):
-                    await async_add_external_statistics(self._hass, metadata, statistics)
-                else:
-                    await self._hass.async_add_executor_job(
-                        async_add_external_statistics, self._hass, metadata, statistics
-                    )
+                await self._async_add_statistics(metadata, statistics)
                 _LOGGER.debug(
                     "%s: added %d statistics entries",
                     prefix,
