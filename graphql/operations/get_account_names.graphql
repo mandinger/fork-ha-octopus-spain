@@ -1,0 +1,9 @@
+query getAccountNames {
+  viewer {
+    accounts {
+      ... on Account {
+        number
+      }
+    }
+  }
+}
