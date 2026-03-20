@@ -42,6 +42,35 @@ class OctopusSpain:
         self._token = response["data"]["obtainKrakenToken"]["token"]
         return True
 
+    async def regenerate_api_key(self) -> str | None:
+        """Generate a new API key for the authenticated user.
+
+        Returns the generated key when successful, otherwise None.
+        """
+        if self._token is None:
+            if not await self.login():
+                return None
+
+        mutation = """
+            mutation regenerateSecretKey {
+              regenerateSecretKey {
+                key
+              }
+            }
+        """
+        headers = {"authorization": self._token}
+        client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
+        response = await client.execute_async(mutation)
+        if "errors" in response:
+            _LOGGER.error("GraphQL errors while regenerating API key: %s", response["errors"])
+            return None
+
+        return (
+            response.get("data", {})
+            .get("regenerateSecretKey", {})
+            .get("key")
+        )
+
     async def accounts(self):
         query = """
              query getAccountNames{
