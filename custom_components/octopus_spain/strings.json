@@ -3,19 +3,59 @@
     "step": {
       "user": {
         "data": {
-          "host": "[%key:common::config_flow::data::host%]",
-          "username": "[%key:common::config_flow::data::username%]",
-          "password": "[%key:common::config_flow::data::password%]"
-        }
+          "has_apikey": "I already have an API key"
+        },
+        "description": "API key authentication is the recommended way to use this integration."
+      },
+      "apikey": {
+        "data": {
+          "apikey": "API key"
+        },
+        "description": "Using an API key is the recommended authentication method."
+      },
+      "credentials": {
+        "data": {
+          "email": "[%key:common::config_flow::data::username%]",
+          "password": "[%key:common::config_flow::data::password%]",
+          "generate_apikey": "Use my credentials to obtain an API key"
+        },
+        "description": "Octopus Energy Spain does not directly provide a way for users to generate or manage API keys, but this integration can generate one for you. Generating a new API key will invalidate any previous API keys for this user."
+      },
+      "generated_apikey": {
+        "data": {
+          "apikey": "API key"
+        },
+        "description": "Your new API key is shown below and pre-filled so you can copy it. This is the only time it can be viewed."
       }
     },
     "error": {
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
       "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
+      "cannot_generate_apikey": "Unable to generate an API key",
       "unknown": "[%key:common::config_flow::error::unknown%]"
     },
     "abort": {
       "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "auth_type": "Authentication method"
+        }
+      },
+      "apikey": {
+        "data": {
+          "apikey": "API key"
+        }
+      },
+      "credentials": {
+        "data": {
+          "email": "[%key:common::config_flow::data::username%]",
+          "password": "[%key:common::config_flow::data::password%]"
+        }
+      }
     }
   }
 }

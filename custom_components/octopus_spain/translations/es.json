@@ -4,25 +4,61 @@
       "already_configured": "Device is already configured"
     },
     "error": {
-      "invalid_auth": "Email o contraseña inválidos."
+      "invalid_auth": "Las credenciales o la API key no son válidas.",
+      "cannot_generate_apikey": "No se pudo generar una API key con estas credenciales."
     },
     "step": {
       "user": {
         "title": "Octopus Energy Spain",
         "data": {
+          "has_apikey": "Ya tengo una API key"
+        },
+        "description": "La autenticación con API key es la forma recomendada de usar esta integración."
+      },
+      "apikey": {
+        "title": "API key (recomendado)",
+        "data": {
+          "apikey": "API key"
+        },
+        "description": "Usar una API key es el método de autenticación recomendado."
+      },
+      "credentials": {
+        "title": "Credenciales",
+        "data": {
           "email": "Email",
-          "password": "Contraseña"
-        }
+          "password": "Contraseña",
+          "generate_apikey": "Usar mis credenciales para obtener una API key"
+        },
+        "description": "Octopus Energy Spain no ofrece de forma directa un mecanismo para que el usuario genere o gestione sus API keys, pero esta integración puede generarla por ti. Generar una nueva API key invalidará cualquier API key previa del usuario."
+      },
+      "generated_apikey": {
+        "title": "API key generada",
+        "data": {
+          "apikey": "API key"
+        },
+        "description": "Tu nueva API key se muestra abajo y queda precargada para que puedas copiarla. Esta es la única vez que podrá visualizarse."
       }
     }
   },
   "options": {
     "error": {
-      "invalid_auth": "Email o contraseña inválidos."
+      "invalid_auth": "Las credenciales o la API key no son válidas."
     },
     "step": {
       "init": {
         "title": "Octopus Energy Spain.",
+        "data": {
+          "auth_type": "Método de autenticación"
+        }
+      },
+      "apikey": {
+        "title": "API key",
+        "data": {
+          "apikey": "API key"
+        }
+      },
+      "credentials": {
+        "title": "Credenciales",
         "data": {
           "email": "Email",
           "password": "Contraseña"

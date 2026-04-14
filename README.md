@@ -39,7 +39,14 @@ Durante la configuración podrás elegir el tipo de autenticación:
 - Credenciales (email y contraseña)
 - API Key
 
-Si eliges API Key, introduce tu api key (detalles en como obtener api key en octopus españa mas adelante); no se requiere email/contraseña. Podrás cambiar el método más tarde desde las Opciones de la integración. Para más información sobre tu cuenta, consulta [Octopus Energy](https://octopusenergy.es/).
+La opción recomendada es usar **API Key**:
+- Si ya tienes una API key, introdúcela y no se requiere email/contraseña.
+- Si no tienes API key, puedes usar email/contraseña y activar la opción **"Usar mis credenciales para obtener una API key"** durante la configuración.
+- Importante: Octopus Energy España no ofrece directamente una forma para que el usuario genere o gestione sus API keys; la integración puede generarla por ti.
+- Al generar una nueva API key, se invalidarán las API keys anteriores de ese usuario.
+- La API key generada solo se muestra una vez para que puedas copiarla.
+
+Podrás cambiar el método más tarde desde las Opciones de la integración. Para más información sobre tu cuenta, consulta [Octopus Energy](https://octopusenergy.es/).
 
 
 

@@ -1,0 +1,24 @@
+query getAccountBilling($account: String!) {
+  account(accountNumber: $account) {
+    ledgers {
+      ledgerType
+      balance
+      invoices(last: 1) {
+        edges {
+          node {
+            id
+            invoicedAmount
+            earliestChargeAt
+            firstIssued
+            pdfUrl
+            totalCharges {
+              grossTotal
+              netTotal
+              taxTotal
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -59,3 +59,12 @@ class OctopusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> list[dict[str, Any]]:
         """Fetch hourly consumption for a specific range."""
         return await self._api.hourly_consumption(account, start=start, end=end)
+
+    async def async_fetch_daily_consumption(
+        self,
+        account: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[dict[str, Any]]:
+        """Fetch daily consumption for a specific range."""
+        return await self._api.daily_consumption(account, start=start, end=end)
