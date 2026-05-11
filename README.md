@@ -108,3 +108,13 @@ Puedes encontrar un panel de ejemplo listo para usar en [ha/dashboard.yml](ha/da
 
 ![card.png](img/dashboard.png)
 
+## Licencia
+
+Este repositorio incluye una licencia MIT en [LICENSE.txt](LICENSE.txt), pero el proyecto está basado en código de
+[MiguelAngelLV/ha-octopus-spain](https://github.com/MiguelAngelLV/ha-octopus-spain), que no incluía una licencia
+explícita en el momento en que se creó este fork.
+
+Por ese motivo, la licencia MIT de este repositorio se aplica únicamente a las contribuciones, cambios y código nuevo
+añadidos en este fork por sus autores. No pretende relicenciar el código preexistente del proyecto original ni conceder
+derechos sobre partes cuyo copyright pertenezca a terceros.
+
