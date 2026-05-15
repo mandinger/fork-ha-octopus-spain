@@ -88,7 +88,7 @@ El componente no ofrece consumo en tiempo real. En su lugar, importa de forma re
 - Funcionamiento: en cada actualización se añaden las horas faltantes desde la última hora importada. Si no existen estadísticas previas, se inicia desde el día 1 del mes actual (UTC).
 - Tipo de dato: estadística externa con suma acumulada por hora.
 - Unidad: kWh.
-- Identificador de estadística (`statistic_id`): `octopus_spain:energy_consumption_<cuenta_slug>`.
+- Identificador de estadística (`statistic_id`): `octopus_spain_fork:energy_consumption_<cuenta_slug>`.
 - Nombre mostrado en HA: "Consumo Electrico" o "Consumo Electrico (<cuenta>)" cuando hay varias cuentas.
 
 Uso en interfaz:

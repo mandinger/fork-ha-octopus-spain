@@ -17,7 +17,7 @@ from typing import Any
 
 DEFAULT_INTROSPECTION = Path("docs/InstrospectionQuery.json")
 DEFAULT_OPERATIONS_DIR = Path("graphql/operations")
-DEFAULT_OUTPUT = Path("custom_components/octopus_spain/lib/graphql_helpers/generated.py")
+DEFAULT_OUTPUT = Path("custom_components/octopus_spain_fork/lib/graphql_helpers/generated.py")
 
 SCALAR_MAP = {
     "String": "str",

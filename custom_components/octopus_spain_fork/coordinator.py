@@ -9,7 +9,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .const import UPDATE_INTERVAL
-from .lib.octopus_spain import OctopusSpain
+from .lib.octopus_spain_fork import OctopusSpain
 
 _LOGGER = logging.getLogger(__name__)
 
