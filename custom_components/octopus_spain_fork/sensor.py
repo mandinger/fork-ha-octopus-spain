@@ -30,11 +30,17 @@ try:
     from homeassistant.components.recorder.statistics import STATISTIC_SUM
 except ImportError:  # pragma: no cover - fallback if constant missing
     STATISTIC_SUM = "sum"
+try:
+    from homeassistant.components.recorder.statistics import async_update_statistics_metadata
+except ImportError:  # pragma: no cover - older Home Assistant versions
+    async_update_statistics_metadata = None
 from .const import DOMAIN
 from .coordinator import OctopusCoordinator
 from .runtime import OctopusSpainConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
+
+ENERGY_UNIT_CLASS = "energy"
 
 
 async def async_setup_entry(
@@ -48,6 +54,7 @@ async def async_setup_entry(
     sensors = []
     accounts = list(coordinator.data)
     single_account = len(accounts) == 1
+    consumption_sensors: dict[str, OctopusConsumptionStatisticsSensor] = {}
     for account in accounts:
         # Wallets
         sensors.append(
@@ -60,6 +67,11 @@ async def async_setup_entry(
         )
         # Aggregate invoice entity (back-compat)
         sensors.append(OctopusInvoice(account, coordinator, single_account))
+        consumption_sensor = OctopusConsumptionStatisticsSensor(
+            account, coordinator, single_account
+        )
+        consumption_sensors[account] = consumption_sensor
+        sensors.append(consumption_sensor)
 
         # Individual Last Invoice fields
         name_prefix = "Factura" if single_account else f"Factura ({account})"
@@ -150,6 +162,7 @@ async def async_setup_entry(
             coordinator=coordinator,
             account=account,
             single=single_account,
+            state_callback=consumption_sensors[account].async_set_native_value,
         )
         await importer.async_setup()
         entry.async_on_unload(importer.close)
@@ -394,6 +407,44 @@ class OctopusInvoiceFieldSensor(CoordinatorEntity[OctopusCoordinator], SensorEnt
     def extra_state_attributes(self) -> Mapping[str, Any] | None:
         return self._attrs
 
+
+class OctopusConsumptionStatisticsSensor(
+    CoordinatorEntity[OctopusCoordinator], SensorEntity
+):
+    """Expose the imported cumulative consumption statistic as an energy sensor."""
+
+    def __init__(
+        self,
+        account: str,
+        coordinator: OctopusCoordinator,
+        single: bool,
+    ) -> None:
+        super().__init__(coordinator=coordinator)
+        self._state: StateType = None
+        self._account = account
+        safe_account = slugify(account)
+        self._attr_name = "Consumo Electrico" if single else f"Consumo Electrico ({account})"
+        self._attr_unique_id = f"energy_consumption_{safe_account}"
+        self.entity_description = SensorEntityDescription(
+            key=f"energy_consumption_{safe_account}",
+            icon="mdi:transmission-tower-import",
+            device_class=SensorDeviceClass.ENERGY,
+            native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            state_class=SensorStateClass.TOTAL_INCREASING,
+        )
+
+    @callback
+    def async_set_native_value(self, value: float | None) -> None:
+        """Update the sensor from the imported recorder statistic total."""
+        self._state = value
+        if getattr(self, "_hass", None) is not None:
+            self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> StateType:
+        return self._state
+
+
 class OctopusConsumptionStatisticsImporter:
     """Process coordinator data to feed historical consumption into statistics."""
 
@@ -403,10 +454,12 @@ class OctopusConsumptionStatisticsImporter:
         coordinator: OctopusCoordinator,
         account: str,
         single: bool,
+        state_callback: Callable[[float | None], None],
     ) -> None:
         self._hass = hass
         self._coordinator = coordinator
         self._account = account
+        self._state_callback = state_callback
         safe_account = slugify(account)
         self._statistic_id = f"{DOMAIN}:energy_consumption_{safe_account}"
         self._name = "Consumo Electrico" if single else f"Consumo Electrico ({account})"
@@ -428,6 +481,37 @@ class OctopusConsumptionStatisticsImporter:
     def _schedule_update(self) -> None:
         """Schedule processing for the latest coordinator data."""
         self._hass.async_create_task(self._async_process_update())
+
+    def _update_statistics_metadata(self) -> None:
+        """Ensure existing recorder metadata is classified as energy."""
+        if async_update_statistics_metadata is None:
+            return
+        try:
+            async_update_statistics_metadata(
+                self._hass,
+                self._statistic_id,
+                new_unit_class=ENERGY_UNIT_CLASS,
+                new_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            )
+        except TypeError:
+            try:
+                async_update_statistics_metadata(
+                    self._hass,
+                    self._statistic_id,
+                    new_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+                )
+            except Exception as err:  # pragma: no cover - best-effort metadata repair
+                _LOGGER.debug(
+                    "%s: unable to update statistic metadata: %s",
+                    self._statistic_id,
+                    err,
+                )
+        except Exception as err:  # pragma: no cover - best-effort metadata repair
+            _LOGGER.debug(
+                "%s: unable to update statistic metadata: %s",
+                self._statistic_id,
+                err,
+            )
 
     @staticmethod
     def _parse_stat_start(value: Any) -> datetime | None:
@@ -944,6 +1028,8 @@ class OctopusConsumptionStatisticsImporter:
                 )
             else:
                 _LOGGER.debug("%s: no existing statistics found, starting fresh", prefix)
+            self._state_callback(last_sum if last_start is not None else None)
+            self._update_statistics_metadata()
 
             now_utc = dt_util.utcnow()
             today_utc = now_utc.date()
@@ -1057,7 +1143,7 @@ class OctopusConsumptionStatisticsImporter:
                 "source": DOMAIN,
                 "statistic_id": self._statistic_id,
                 "unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
-                "unit_class": None,
+                "unit_class": ENERGY_UNIT_CLASS,
             }
             _LOGGER.debug("%s: filled metadata statistics metadata=%s", prefix, metadata)
 
@@ -1095,6 +1181,7 @@ class OctopusConsumptionStatisticsImporter:
                     last_start,
                     last_sum,
                 )
+                self._state_callback(last_sum)
 
             sorted_meas = sorted(measurements_by_start.items(), key=lambda item: item[0])
             _LOGGER.debug("%s: sorted measurements count=%s", prefix, len(sorted_meas))
@@ -1149,12 +1236,14 @@ class OctopusConsumptionStatisticsImporter:
                     statistics,
                 )
                 await self._async_add_statistics(metadata, statistics)
+                self._state_callback(running_sum)
                 _LOGGER.debug(
                     "%s: added %d statistics entries",
                     prefix,
                     len(statistics),
                 )
             else:
+                self._state_callback(running_sum)
                 _LOGGER.debug("%s: no new statistics to add (running_sum=%s)", prefix, running_sum)
 
         except Exception as err:  # pylint: disable=broad-except
