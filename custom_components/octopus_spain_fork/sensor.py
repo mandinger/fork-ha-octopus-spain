@@ -47,6 +47,16 @@ _LOGGER = logging.getLogger(__name__)
 ENERGY_UNIT_CLASS = "energy"
 
 
+def _account_slug(account: str) -> str:
+    """Return a stable slug for account-scoped entity IDs."""
+    return slugify(account)
+
+
+def _account_name(name: str, account: str) -> str:
+    """Return a display name scoped to an Octopus account."""
+    return f"{name} ({account})"
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: OctopusSpainConfigEntry,
@@ -78,7 +88,7 @@ async def async_setup_entry(
         sensors.append(consumption_sensor)
 
         # Individual Last Invoice fields
-        name_prefix = "Factura" if single_account else f"Factura ({account})"
+        name_prefix = _account_name("Factura", account)
         # Monetary fields (euros)
         sensors.extend(
             [
@@ -189,11 +199,13 @@ class OctopusWallet(CoordinatorEntity[OctopusCoordinator], SensorEntity):
         self._state = None
         self._key = key
         self._account = account
+        safe_account = _account_slug(account)
         self._attrs: Mapping[str, Any] = {}
-        self._attr_name = name if single else f"{name} ({account})"
-        self._attr_unique_id = f"{key}_{account}"
+        self._attr_name = _account_name(name, account)
+        self._attr_entity_id = f"sensor.octopus_{key}_{safe_account}"
+        self._attr_unique_id = f"{key}_{safe_account}"
         self.entity_description = SensorEntityDescription(
-            key=f"{key}_{account}",
+            key=f"{key}_{safe_account}",
             icon="mdi:piggy-bank-outline",
             native_unit_of_measurement=CURRENCY_EURO,
             state_class=SensorStateClass.MEASUREMENT
@@ -220,11 +232,13 @@ class OctopusInvoice(CoordinatorEntity[OctopusCoordinator], SensorEntity):
         super().__init__(coordinator=coordinator)
         self._state = None
         self._account = account
+        safe_account = _account_slug(account)
         self._attrs: Mapping[str, Any] = {}
-        self._attr_name = "Última Factura Octopus" if single else f"Última Factura Octopus ({account})"
-        self._attr_unique_id = f"last_invoice_{account}"
+        self._attr_name = _account_name("Última Factura Octopus", account)
+        self._attr_entity_id = f"sensor.octopus_last_invoice_{safe_account}"
+        self._attr_unique_id = f"last_invoice_{safe_account}"
         self.entity_description = SensorEntityDescription(
-            key=f"last_invoice_{account}",
+            key=f"last_invoice_{safe_account}",
             icon="mdi:currency-eur",
             native_unit_of_measurement=CURRENCY_EURO,
             state_class=SensorStateClass.MEASUREMENT
@@ -328,11 +342,14 @@ class OctopusInvoiceFieldSensor(CoordinatorEntity[OctopusCoordinator], SensorEnt
         self._state: StateType = None
         self._account = account
         self._field = field
+        safe_account = _account_slug(account)
+        safe_field = slugify(field)
         self._attrs: Mapping[str, Any] = {}
         self._attr_name = name
-        self._attr_unique_id = f"last_invoice_{field}_{account}"
+        self._attr_entity_id = f"sensor.octopus_last_invoice_{safe_field}_{safe_account}"
+        self._attr_unique_id = f"last_invoice_{safe_field}_{safe_account}"
         desc_kwargs: dict[str, Any] = {
-            "key": f"last_invoice_{field}_{account}",
+            "key": f"last_invoice_{safe_field}_{safe_account}",
         }
         if icon:
             desc_kwargs["icon"] = icon
@@ -427,13 +444,9 @@ class OctopusConsumptionStatisticsSensor(
         super().__init__(coordinator=coordinator)
         self._state: StateType = None
         self._account = account
-        safe_account = slugify(account)
-        self._attr_name = "Consumo Electrico" if single else f"Consumo Electrico ({account})"
-        self._attr_entity_id = (
-            "sensor.consumo_electrico"
-            if single
-            else f"sensor.consumo_electrico_{safe_account}"
-        )
+        safe_account = _account_slug(account)
+        self._attr_name = _account_name("Consumo Electrico", account)
+        self._attr_entity_id = f"sensor.consumo_electrico_{safe_account}"
         self._attr_unique_id = f"energy_consumption_{safe_account}"
         self._statistic_id = self._attr_entity_id
         self.entity_description = SensorEntityDescription(
@@ -477,10 +490,10 @@ class OctopusConsumptionStatisticsImporter:
         self._coordinator = coordinator
         self._account = account
         self._state_callback = state_callback
-        safe_account = slugify(account)
+        safe_account = _account_slug(account)
         self._statistic_id = statistic_id
         self._legacy_statistic_id = f"{DOMAIN}:energy_consumption_{safe_account}"
-        self._name = "Consumo Electrico" if single else f"Consumo Electrico ({account})"
+        self._name = _account_name("Consumo Electrico", account)
         self._remove_listener: Callable[[], None] | None = None
         self._reconcile_warning_fingerprint_by_day: dict[date, tuple[int, float, float]] = {}
         self._negative_consumption_fingerprints: set[str] = set()
