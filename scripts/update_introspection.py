@@ -25,7 +25,7 @@ DEFAULT_OUTPUT = Path("docs/InstrospectionQuery.json")
 DEFAULT_QUERY_FILE = Path("docs/introspection.full.query")
 DEFAULT_ENDPOINT = "https://api.oees-kraken.energy/v1/graphql/"
 DEFAULT_DOCS_DIR = Path(".codex/graphql")
-DEFAULT_HELPERS_OUTPUT = Path("custom_components/octopus_spain/lib/graphql_helpers/generated.py")
+DEFAULT_HELPERS_OUTPUT = Path("custom_components/octopus_spain_fork/lib/graphql_helpers/generated.py")
 DEFAULT_OPERATIONS_DIR = Path("graphql/operations")
 
 

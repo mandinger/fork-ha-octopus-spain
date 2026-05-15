@@ -1,7 +1,7 @@
 """Constants for Octopus Energy Spain."""
 from typing import Final
 
-DOMAIN = "octopus_spain"
+DOMAIN = "octopus_spain_fork"
 CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 CONF_APIKEY = "apikey"
