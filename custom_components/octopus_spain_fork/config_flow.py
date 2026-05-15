@@ -25,7 +25,7 @@ from .const import (
     CONF_PASSWORD,
     DOMAIN,
 )
-from .lib.octopus_spain import OctopusSpain
+from .lib.octopus_spain_fork import OctopusSpain
 
 _LOGGER = logging.getLogger(__name__)
 
