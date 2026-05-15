@@ -15,7 +15,7 @@ python3 scripts/generate_graphql_helpers.py
 
 Output file:
 
-- `custom_components/octopus_spain/lib/graphql_helpers/generated.py`
+- `custom_components/octopus_spain_fork/lib/graphql_helpers/generated.py`
 
 ## Current operation files
 
@@ -27,7 +27,7 @@ Output file:
 ## Optional usage example
 
 ```python
-from custom_components.octopus_spain.lib.graphql_helpers.generated import (
+from custom_components.octopus_spain_fork.lib.graphql_helpers.generated import (
     ObtainJSONWebTokenInput,
     ObtainKrakenTokenVariables,
     build_obtain_kraken_token_request,

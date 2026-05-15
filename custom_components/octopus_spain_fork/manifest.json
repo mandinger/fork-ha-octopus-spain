@@ -1,5 +1,5 @@
 {
-  "domain": "octopus_spain",
+  "domain": "octopus_spain_fork",
   "name": "Octopus Spain",
   "after_dependencies": ["recorder"],
   "codeowners": ["@mandinger"],
