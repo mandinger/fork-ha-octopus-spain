@@ -14,18 +14,22 @@ from homeassistant.const import (
     CURRENCY_EURO,
     UnitOfEnergy,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant, callback, valid_entity_id
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 from homeassistant.util import slugify
 
-from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder import DOMAIN as RECORDER_DOMAIN, get_instance
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
 )
+try:
+    from homeassistant.components.recorder.statistics import async_import_statistics
+except ImportError:  # pragma: no cover - older Home Assistant versions
+    async_import_statistics = None
 try:
     from homeassistant.components.recorder.statistics import STATISTIC_SUM
 except ImportError:  # pragma: no cover - fallback if constant missing
@@ -162,6 +166,7 @@ async def async_setup_entry(
             coordinator=coordinator,
             account=account,
             single=single_account,
+            statistic_id=consumption_sensors[account].statistic_id,
             state_callback=consumption_sensors[account].async_set_native_value,
         )
         await importer.async_setup()
@@ -424,7 +429,13 @@ class OctopusConsumptionStatisticsSensor(
         self._account = account
         safe_account = slugify(account)
         self._attr_name = "Consumo Electrico" if single else f"Consumo Electrico ({account})"
+        self._attr_entity_id = (
+            "sensor.consumo_electrico"
+            if single
+            else f"sensor.consumo_electrico_{safe_account}"
+        )
         self._attr_unique_id = f"energy_consumption_{safe_account}"
+        self._statistic_id = self._attr_entity_id
         self.entity_description = SensorEntityDescription(
             key=f"energy_consumption_{safe_account}",
             icon="mdi:transmission-tower-import",
@@ -444,6 +455,11 @@ class OctopusConsumptionStatisticsSensor(
     def native_value(self) -> StateType:
         return self._state
 
+    @property
+    def statistic_id(self) -> str:
+        """Return the statistic id used by the Energy Dashboard for this sensor."""
+        return self._statistic_id
+
 
 class OctopusConsumptionStatisticsImporter:
     """Process coordinator data to feed historical consumption into statistics."""
@@ -454,6 +470,7 @@ class OctopusConsumptionStatisticsImporter:
         coordinator: OctopusCoordinator,
         account: str,
         single: bool,
+        statistic_id: str,
         state_callback: Callable[[float | None], None],
     ) -> None:
         self._hass = hass
@@ -461,7 +478,8 @@ class OctopusConsumptionStatisticsImporter:
         self._account = account
         self._state_callback = state_callback
         safe_account = slugify(account)
-        self._statistic_id = f"{DOMAIN}:energy_consumption_{safe_account}"
+        self._statistic_id = statistic_id
+        self._legacy_statistic_id = f"{DOMAIN}:energy_consumption_{safe_account}"
         self._name = "Consumo Electrico" if single else f"Consumo Electrico ({account})"
         self._remove_listener: Callable[[], None] | None = None
         self._reconcile_warning_fingerprint_by_day: dict[date, tuple[int, float, float]] = {}
@@ -486,6 +504,37 @@ class OctopusConsumptionStatisticsImporter:
         """Ensure existing recorder metadata is classified as energy."""
         if async_update_statistics_metadata is None:
             return
+        if self._legacy_statistic_id != self._statistic_id:
+            try:
+                async_update_statistics_metadata(
+                    self._hass,
+                    self._legacy_statistic_id,
+                    new_statistic_id=self._statistic_id,
+                    new_unit_class=ENERGY_UNIT_CLASS,
+                    new_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+                )
+            except TypeError:
+                try:
+                    async_update_statistics_metadata(
+                        self._hass,
+                        self._legacy_statistic_id,
+                        new_statistic_id=self._statistic_id,
+                        new_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+                    )
+                except Exception as err:  # pragma: no cover - best-effort metadata repair
+                    _LOGGER.debug(
+                        "%s: unable to migrate statistic metadata to %s: %s",
+                        self._legacy_statistic_id,
+                        self._statistic_id,
+                        err,
+                    )
+            except Exception as err:  # pragma: no cover - best-effort metadata repair
+                _LOGGER.debug(
+                    "%s: unable to migrate statistic metadata to %s: %s",
+                    self._legacy_statistic_id,
+                    self._statistic_id,
+                    err,
+                )
         try:
             async_update_statistics_metadata(
                 self._hass,
@@ -550,11 +599,22 @@ class OctopusConsumptionStatisticsImporter:
     async def _async_add_statistics(self, metadata: dict[str, Any], statistics: list[dict[str, Any]]) -> None:
         if not statistics:
             return
-        if iscoroutinefunction(async_add_external_statistics):
-            await async_add_external_statistics(self._hass, metadata, statistics)
+        add_statistics = (
+            async_import_statistics
+            if valid_entity_id(metadata["statistic_id"])
+            else async_add_external_statistics
+        )
+        if add_statistics is None:
+            _LOGGER.warning(
+                "%s: this Home Assistant version cannot import entity statistics",
+                self._statistic_id,
+            )
+            return
+        if iscoroutinefunction(add_statistics):
+            await add_statistics(self._hass, metadata, statistics)
         else:
             await self._hass.async_add_executor_job(
-                async_add_external_statistics, self._hass, metadata, statistics
+                add_statistics, self._hass, metadata, statistics
             )
 
     async def _async_reconcile_current_month(
@@ -1137,10 +1197,11 @@ class OctopusConsumptionStatisticsImporter:
             )
 
             metadata = {
+                "has_mean": False,
                 "mean_type": 0,
                 "has_sum": True,
                 "name": self._name,
-                "source": DOMAIN,
+                "source": RECORDER_DOMAIN if valid_entity_id(self._statistic_id) else DOMAIN,
                 "statistic_id": self._statistic_id,
                 "unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
                 "unit_class": ENERGY_UNIT_CLASS,
