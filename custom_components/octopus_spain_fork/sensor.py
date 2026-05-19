@@ -1,5 +1,5 @@
 import logging
-from inspect import iscoroutinefunction
+from inspect import isawaitable
 from datetime import datetime, date, time, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Callable
@@ -68,7 +68,6 @@ async def async_setup_entry(
     sensors = []
     accounts = list(coordinator.data)
     single_account = len(accounts) == 1
-    consumption_sensors: dict[str, OctopusConsumptionStatisticsSensor] = {}
     for account in accounts:
         # Wallets
         sensors.append(
@@ -84,7 +83,6 @@ async def async_setup_entry(
         consumption_sensor = OctopusConsumptionStatisticsSensor(
             account, coordinator, single_account
         )
-        consumption_sensors[account] = consumption_sensor
         sensors.append(consumption_sensor)
 
         # Individual Last Invoice fields
@@ -170,18 +168,6 @@ async def async_setup_entry(
                 ),
             ]
         )
-    for account in accounts:
-        importer = OctopusConsumptionStatisticsImporter(
-            hass=hass,
-            coordinator=coordinator,
-            account=account,
-            single=single_account,
-            statistic_id=consumption_sensors[account].statistic_id,
-            state_callback=consumption_sensors[account].async_set_native_value,
-        )
-        await importer.async_setup()
-        entry.async_on_unload(importer.close)
-
     async_add_entities(sensors)
 
 
@@ -444,6 +430,9 @@ class OctopusConsumptionStatisticsSensor(
         super().__init__(coordinator=coordinator)
         self._state: StateType = None
         self._account = account
+        self._single = single
+        self._attrs: Mapping[str, Any] = {}
+        self._importer: OctopusConsumptionStatisticsImporter | None = None
         safe_account = _account_slug(account)
         self._attr_name = _account_name("Consumo Electrico", account)
         self._attr_entity_id = f"sensor.consumo_electrico_{safe_account}"
@@ -457,16 +446,41 @@ class OctopusConsumptionStatisticsSensor(
             state_class=SensorStateClass.TOTAL_INCREASING,
         )
 
+    async def async_added_to_hass(self) -> None:
+        """Start importing statistics once Home Assistant has assigned entity_id."""
+        await super().async_added_to_hass()
+        self._statistic_id = self.entity_id
+        self._importer = OctopusConsumptionStatisticsImporter(
+            hass=self.hass,
+            coordinator=self.coordinator,
+            account=self._account,
+            single=self._single,
+            statistic_id=self._statistic_id,
+            state_callback=self.async_set_native_value,
+        )
+        self.async_on_remove(self._importer.close)
+        await self._importer.async_setup()
+
     @callback
-    def async_set_native_value(self, value: float | None) -> None:
+    def async_set_native_value(
+        self,
+        value: float | None,
+        attrs: Mapping[str, Any] | None = None,
+    ) -> None:
         """Update the sensor from the imported recorder statistic total."""
         self._state = value
+        if attrs is not None:
+            self._attrs = attrs
         if getattr(self, "_hass", None) is not None:
             self.async_write_ha_state()
 
     @property
     def native_value(self) -> StateType:
         return self._state
+
+    @property
+    def extra_state_attributes(self) -> Mapping[str, Any]:
+        return self._attrs
 
     @property
     def statistic_id(self) -> str:
@@ -484,15 +498,17 @@ class OctopusConsumptionStatisticsImporter:
         account: str,
         single: bool,
         statistic_id: str,
-        state_callback: Callable[[float | None], None],
+        state_callback: Callable[[float | None, Mapping[str, Any] | None], None],
     ) -> None:
         self._hass = hass
         self._coordinator = coordinator
         self._account = account
+        self._single = single
         self._state_callback = state_callback
         safe_account = _account_slug(account)
         self._statistic_id = statistic_id
         self._legacy_statistic_id = f"{DOMAIN}:energy_consumption_{safe_account}"
+        self._default_entity_statistic_id = f"sensor.consumo_electrico_{safe_account}"
         self._name = _account_name("Consumo Electrico", account)
         self._remove_listener: Callable[[], None] | None = None
         self._reconcile_warning_fingerprint_by_day: dict[date, tuple[int, float, float]] = {}
@@ -517,11 +533,19 @@ class OctopusConsumptionStatisticsImporter:
         """Ensure existing recorder metadata is classified as energy."""
         if async_update_statistics_metadata is None:
             return
-        if self._legacy_statistic_id != self._statistic_id:
+        legacy_statistic_ids = {
+            self._legacy_statistic_id,
+            self._default_entity_statistic_id,
+        }
+        if self._single:
+            legacy_statistic_ids.add("sensor.consumo_electrico")
+        for legacy_statistic_id in legacy_statistic_ids:
+            if legacy_statistic_id == self._statistic_id:
+                continue
             try:
                 async_update_statistics_metadata(
                     self._hass,
-                    self._legacy_statistic_id,
+                    legacy_statistic_id,
                     new_statistic_id=self._statistic_id,
                     new_unit_class=ENERGY_UNIT_CLASS,
                     new_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
@@ -530,21 +554,21 @@ class OctopusConsumptionStatisticsImporter:
                 try:
                     async_update_statistics_metadata(
                         self._hass,
-                        self._legacy_statistic_id,
+                        legacy_statistic_id,
                         new_statistic_id=self._statistic_id,
                         new_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
                     )
                 except Exception as err:  # pragma: no cover - best-effort metadata repair
                     _LOGGER.debug(
                         "%s: unable to migrate statistic metadata to %s: %s",
-                        self._legacy_statistic_id,
+                        legacy_statistic_id,
                         self._statistic_id,
                         err,
                     )
             except Exception as err:  # pragma: no cover - best-effort metadata repair
                 _LOGGER.debug(
                     "%s: unable to migrate statistic metadata to %s: %s",
-                    self._legacy_statistic_id,
+                    legacy_statistic_id,
                     self._statistic_id,
                     err,
                 )
@@ -623,12 +647,9 @@ class OctopusConsumptionStatisticsImporter:
                 self._statistic_id,
             )
             return
-        if iscoroutinefunction(add_statistics):
-            await add_statistics(self._hass, metadata, statistics)
-        else:
-            await self._hass.async_add_executor_job(
-                add_statistics, self._hass, metadata, statistics
-            )
+        result = add_statistics(self._hass, metadata, statistics)
+        if isawaitable(result):
+            await result
 
     async def _async_reconcile_current_month(
         self,
@@ -920,8 +941,9 @@ class OctopusConsumptionStatisticsImporter:
             day = start_utc.date()
             if day < compare_start_day or day > complete_until:
                 continue
+            raw_value = item.get("value") if isinstance(item, Mapping) else item
             val = self._parse_non_negative_kwh(
-                item.get("value"),
+                raw_value,
                 prefix=prefix,
                 label=f"seed-hourly:{start_utc.isoformat()}",
             )
@@ -1031,6 +1053,162 @@ class OctopusConsumptionStatisticsImporter:
                         delta,
                     )
 
+    @staticmethod
+    def _parse_api_start(value: Any) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        parsed = dt_util.parse_datetime(value)
+        if parsed is None:
+            return None
+        return dt_util.as_utc(parsed)
+
+    @staticmethod
+    def _month_import_window(now_utc: datetime) -> tuple[datetime, datetime]:
+        """Return the Home Assistant-local current month window in UTC."""
+        now_local = dt_util.as_local(now_utc)
+        month_start_local = now_local.replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        next_day_local = (now_local + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return dt_util.as_utc(month_start_local), dt_util.as_utc(next_day_local)
+
+    @staticmethod
+    def _parse_stat_sum(point: Mapping[str, Any]) -> float | None:
+        raw_sum = point.get("sum")
+        if raw_sum is None:
+            raw_sum = point.get("state")
+        try:
+            return float(raw_sum)
+        except (TypeError, ValueError):
+            return None
+
+    async def _async_get_stat_points(
+        self,
+        *,
+        hours_to_fetch: int,
+    ) -> list[tuple[datetime, float]]:
+        existing = await get_instance(self._hass).async_add_executor_job(
+            get_last_statistics,
+            self._hass,
+            hours_to_fetch,
+            self._statistic_id,
+            True,
+            {STATISTIC_SUM},
+        )
+        points: list[tuple[datetime, float]] = []
+        for point in existing.get(self._statistic_id, []):
+            parsed_start = self._parse_stat_start(point.get("start"))
+            parsed_sum = self._parse_stat_sum(point)
+            if parsed_start is None or parsed_sum is None:
+                continue
+            points.append((parsed_start, parsed_sum))
+        points.sort(key=lambda item: item[0])
+        return points
+
+    async def _async_add_month_baseline_statistic(
+        self,
+        *,
+        metadata: dict[str, Any],
+        import_start_utc: datetime,
+        baseline_sum: float,
+    ) -> None:
+        """Create statistics metadata even before delayed consumption is available."""
+        await self._async_add_statistics(
+            metadata,
+            [{
+                "start": import_start_utc,
+                "state": baseline_sum,
+                "sum": baseline_sum,
+            }],
+        )
+
+    async def _async_fill_confirmed_zero_hours(
+        self,
+        *,
+        prefix: str,
+        measurements_by_start: dict[datetime, float],
+        import_start_utc: datetime,
+        today_utc: date,
+    ) -> int:
+        """Fill omitted zero-consumption hours only when daily totals confirm it."""
+        if not measurements_by_start:
+            return 0
+
+        complete_until = today_utc - timedelta(days=1)
+        range_start_day = import_start_utc.date()
+        if complete_until < range_start_day:
+            return 0
+
+        range_start = datetime.combine(range_start_day, time.min, dt_util.UTC)
+        range_end = datetime.combine(complete_until + timedelta(days=1), time.min, dt_util.UTC)
+        daily_rows = await self._coordinator.async_fetch_daily_consumption(
+            self._account,
+            range_start,
+            range_end,
+        )
+
+        daily_by_day: dict[date, float] = {}
+        for row in daily_rows:
+            start_utc = self._parse_api_start(row.get("startAt"))
+            if start_utc is None:
+                continue
+            day = start_utc.date()
+            if day < range_start_day or day > complete_until:
+                continue
+            daily_value = self._parse_non_negative_kwh(
+                row.get("value"),
+                prefix=prefix,
+                label=f"zero-fill-daily:{day.isoformat()}",
+            )
+            if daily_value is None:
+                continue
+            daily_by_day[day] = daily_value
+
+        if not daily_by_day:
+            return 0
+
+        tolerance_kwh = 0.05
+        filled = 0
+        for day, daily_total in sorted(daily_by_day.items()):
+            day_start = datetime.combine(day, time.min, dt_util.UTC)
+            slots = [day_start + timedelta(hours=hour) for hour in range(24)]
+            eligible_slots = [
+                slot for slot in slots if slot >= import_start_utc and slot in measurements_by_start
+            ]
+            if eligible_slots:
+                hourly_total = sum(measurements_by_start[slot] for slot in eligible_slots)
+                present_hours = {slot.hour for slot in eligible_slots}
+                missing_hours = sorted(set(range(24)) - present_hours)
+            elif abs(daily_total) <= tolerance_kwh:
+                hourly_total = 0.0
+                missing_hours = list(range(24))
+            else:
+                continue
+
+            if not missing_hours or abs(hourly_total - daily_total) > tolerance_kwh:
+                continue
+
+            filled_for_day = 0
+            for hour in missing_hours:
+                slot = day_start + timedelta(hours=hour)
+                if slot < import_start_utc:
+                    continue
+                measurements_by_start[slot] = 0.0
+                filled_for_day += 1
+
+            if filled_for_day:
+                filled += filled_for_day
+                _LOGGER.debug(
+                    "%s: filled %s zero-consumption hour(s) for %s because daily total matches hourly rows",
+                    prefix,
+                    filled_for_day,
+                    day.isoformat(),
+                )
+
+        return filled
+
     async def _async_process_update(self) -> None:
         prefix = f"OctopusConsumptionStats[{self._account}]"
         try:
@@ -1043,171 +1221,65 @@ class OctopusConsumptionStatisticsImporter:
                 type(measurements_raw).__name__,
             )
 
-            _LOGGER.debug(
-                "%s: requesting last statistics statistic_id=%s",
-                prefix,
-                self._statistic_id,
-            )
-            last = await get_instance(self._hass).async_add_executor_job(
-                get_last_statistics,
-                self._hass,
-                1,
-                self._statistic_id,
-                True,
-                {STATISTIC_SUM},
-            )
-            _LOGGER.debug("%s: last statistics response=%s", prefix, last)
-
-            last_points = last.get(self._statistic_id)
-            last_start = None
-            last_sum = 0.0
-            if last_points:
-                last_point = last_points[-1]
-
-                last_start_raw = last_point.get("start")
-                if isinstance(last_start_raw, (int, float)):
-                    last_start = dt_util.utc_from_timestamp(last_start_raw)
-                elif isinstance(last_start_raw, str):
-                    parsed_start = dt_util.parse_datetime(last_start_raw)
-                    if parsed_start is not None:
-                        last_start = dt_util.as_utc(parsed_start)
-                elif isinstance(last_start_raw, datetime):
-                    if last_start_raw.tzinfo is None:
-                        last_start = last_start_raw.replace(tzinfo=dt_util.UTC)
-                    else:
-                        last_start = dt_util.as_utc(last_start_raw)
-
-                last_sum_raw = last_point.get("sum")
-                if last_sum_raw is None:
-                    last_sum_raw = last_point.get("state")
-                try:
-                    last_sum = float(last_sum_raw or 0.0)
-                except (TypeError, ValueError):
-                    last_sum = 0.0
-
-                if last_point.get("sum") is None and last_point.get("state") is None:
-                    _LOGGER.debug(
-                        "%s: last statistics point lacks sum/state, re-importing from start",
-                        prefix,
-                    )
-                    last_start = None
-                    last_sum = 0.0
-
-                _LOGGER.debug(
-                    "%s: last statistics point start=%s last_sum=%s",
-                    prefix,
-                    last_start,
-                    last_sum,
-                )
-            else:
-                _LOGGER.debug("%s: no existing statistics found, starting fresh", prefix)
-            self._state_callback(last_sum if last_start is not None else None)
             self._update_statistics_metadata()
 
             now_utc = dt_util.utcnow()
             today_utc = now_utc.date()
+            import_start_utc, import_end_utc = self._month_import_window(now_utc)
+            stats_window_hours = max(
+                1,
+                int((import_end_utc - import_start_utc).total_seconds() // 3600) + 96,
+            )
 
-            if last_start is None:
-                fetch_start_day = now_utc.replace(
-                    day=1, hour=0, minute=0, second=0, microsecond=0
-                ).date()
-            else:
-                fetch_start_day = (last_start + timedelta(hours=1)).date()
-
-            keep_from_utc = datetime.combine(fetch_start_day, time.min, dt_util.UTC)
-
-            def _parse_dt(dt_str: str):
-                dt = dt_util.parse_datetime(dt_str)
-                if dt is None:
-                    return None
-                return dt_util.as_utc(dt)
-
-            measurements_by_start: dict[datetime, Any] = {}
-            skipped_seed_unparsed = 0
-            skipped_seed_before_window = 0
-            if isinstance(measurements_raw, list):
-                for item in measurements_raw:
-                    start_at = item.get("startAt")
-                    if not start_at:
-                        continue
-                    start_utc = _parse_dt(start_at)
-                    if start_utc is None:
-                        skipped_seed_unparsed += 1
-                        continue
-                    if start_utc < keep_from_utc:
-                        skipped_seed_before_window += 1
-                        continue
-                    measurements_by_start[start_utc] = item
-
-            additional_count = 0
-            fetched_days: list[date] = []
-            skipped_additional_unparsed = 0
-            skipped_additional_missing = 0
-
-            if fetch_start_day <= today_utc:
-                # Batch fetch in a single request to reduce API calls and avoid rate limits
-                range_start = datetime.combine(fetch_start_day, time.min, dt_util.UTC)
-                range_end = datetime.combine(today_utc + timedelta(days=1), time.min, dt_util.UTC)
-                fetched_days.append(fetch_start_day)
-                fetched = await self._coordinator.async_fetch_hourly_consumption(
-                    self._account,
-                    range_start,
-                    range_end,
-                )
-                if not fetched:
-                    _LOGGER.debug(
-                        "%s: fetched 0 measurements for range %s..%s",
-                        prefix,
-                        fetch_start_day,
-                        today_utc,
-                    )
+            existing_points = await self._async_get_stat_points(
+                hours_to_fetch=stats_window_hours,
+            )
+            baseline_sum = 0.0
+            baseline_start: datetime | None = None
+            last_start: datetime | None = None
+            last_sum = 0.0
+            existing_month_points = 0
+            existing_month_values_by_start: dict[datetime, float] = {}
+            previous_sum = 0.0
+            for point_start, point_sum in existing_points:
+                last_start = point_start
+                last_sum = point_sum
+                if point_start < import_start_utc:
+                    baseline_start = point_start
+                    baseline_sum = point_sum
+                    previous_sum = point_sum
                 else:
-                    additional_count += len(fetched)
-                    for item in fetched:
-                        start_at = item.get("startAt")
-                        if not start_at:
-                            skipped_additional_missing += 1
-                            continue
-                        start_utc = _parse_dt(start_at)
-                        if start_utc is None:
-                            skipped_additional_unparsed += 1
-                            continue
-                        if start_utc < keep_from_utc:
-                            continue
-                        measurements_by_start[start_utc] = item
+                    existing_month_points += 1
+                    if point_start < import_end_utc:
+                        existing_value = point_sum - previous_sum
+                        if existing_value >= 0:
+                            existing_month_values_by_start[point_start] = existing_value
+                    previous_sum = point_sum
+
+            if last_start is not None:
+                _LOGGER.debug(
+                    "%s: last statistics point start=%s last_sum=%s baseline_start=%s baseline_sum=%s existing_month_points=%s",
+                    prefix,
+                    last_start,
+                    last_sum,
+                    baseline_start,
+                    baseline_sum,
+                    existing_month_points,
+                )
             else:
-                _LOGGER.debug(
-                    "%s: no additional range to fetch (fetch_start_day=%s today=%s)",
-                    prefix,
-                    fetch_start_day,
-                    today_utc,
-                )
+                _LOGGER.debug("%s: no existing statistics found, starting fresh", prefix)
 
-            total_measurements = len(measurements_by_start)
-            _LOGGER.debug(
-                "%s: consolidated measurements total=%s additional=%s fetched_days=%s seed_skipped_before=%s seed_skipped_unparsed=%s fetched_skipped_unparsed=%s fetched_skipped_missing=%s",
-                prefix,
-                total_measurements,
-                additional_count,
-                fetched_days,
-                skipped_seed_before_window,
-                skipped_seed_unparsed,
-                skipped_additional_unparsed,
-                skipped_additional_missing,
-            )
-            if not measurements_by_start:
-                _LOGGER.debug(
-                    "%s: no hourly consumption data available after consolidation",
-                    prefix,
-                )
-                return
-
-            # Diagnostic-only comparison to help identify discrepancies with official app totals.
-            await self._async_compare_hourly_vs_daily(
-                prefix=prefix,
-                measurements_by_start=measurements_by_start,
-                today_utc=today_utc,
-            )
+            base_attrs: dict[str, Any] = {
+                "statistic_id": self._statistic_id,
+                "current_month_start": dt_util.as_local(import_start_utc).isoformat(),
+                "current_month_start_utc": import_start_utc.isoformat(),
+                "import_window_end_utc": import_end_utc.isoformat(),
+                "baseline_hour": baseline_start.isoformat() if baseline_start else None,
+                "baseline_sum_kwh": round(baseline_sum, 6),
+                "previous_last_imported_hour": last_start.isoformat() if last_start else None,
+                "previous_last_sum_kwh": round(last_sum, 6) if last_start else None,
+            }
+            self._state_callback(last_sum if last_start is not None else None, base_attrs)
 
             metadata = {
                 "has_mean": False,
@@ -1221,65 +1293,167 @@ class OctopusConsumptionStatisticsImporter:
             }
             _LOGGER.debug("%s: filled metadata statistics metadata=%s", prefix, metadata)
 
-            await self._async_reconcile_current_month(
+            fetched = await self._coordinator.async_fetch_hourly_consumption(
+                self._account,
+                import_start_utc,
+                import_end_utc,
+            )
+            fetched_count = len(fetched) if isinstance(fetched, list) else 0
+            if not fetched:
+                baseline_imported = not existing_month_values_by_start
+                if baseline_imported:
+                    await self._async_add_month_baseline_statistic(
+                        metadata=metadata,
+                        import_start_utc=import_start_utc,
+                        baseline_sum=baseline_sum,
+                    )
+                attrs = {
+                    **base_attrs,
+                    "last_update_success": True,
+                    "last_update_message": "No current-month hourly rows returned by API yet",
+                    "current_month_hourly_rows": 0,
+                    "current_month_api_hourly_rows": 0,
+                    "current_month_preserved_existing_hours": len(existing_month_values_by_start),
+                    "current_month_baseline_imported": baseline_imported,
+                    "current_month_zero_filled_hours": 0,
+                    "current_month_imported_total_kwh": 0.0,
+                    "api_data_through": None,
+                    "hours_not_yet_available": max(
+                        0,
+                        int((import_end_utc - import_start_utc).total_seconds() // 3600),
+                    ),
+                }
+                self._state_callback(baseline_sum, attrs)
+                _LOGGER.debug(
+                    "%s: current-month hourly pull returned 0 rows for %s..%s",
+                    prefix,
+                    import_start_utc,
+                    import_end_utc,
+                )
+                return
+
+            measurements_by_start: dict[datetime, float] = {}
+            measurements_by_start.update(existing_month_values_by_start)
+            api_measurement_starts: set[datetime] = set()
+            skipped_seed_unparsed = 0
+            skipped_seed_before_window = 0
+            if isinstance(measurements_raw, list):
+                for item in measurements_raw:
+                    start_at = item.get("startAt")
+                    if not start_at:
+                        continue
+                    start_utc = self._parse_api_start(start_at)
+                    if start_utc is None:
+                        skipped_seed_unparsed += 1
+                        continue
+                    if start_utc < import_start_utc or start_utc >= import_end_utc:
+                        skipped_seed_before_window += 1
+                        continue
+                    value = self._parse_non_negative_kwh(
+                        item.get("value"),
+                        prefix=prefix,
+                        label=f"seed-hourly:{start_utc.isoformat()}",
+                    )
+                    if value is None:
+                        continue
+                    measurements_by_start[start_utc] = value
+                    api_measurement_starts.add(start_utc)
+
+            skipped_additional_unparsed = 0
+            skipped_additional_missing = 0
+            skipped_additional_invalid = 0
+            for item in fetched:
+                start_at = item.get("startAt")
+                if not start_at:
+                    skipped_additional_missing += 1
+                    continue
+                start_utc = self._parse_api_start(start_at)
+                if start_utc is None:
+                    skipped_additional_unparsed += 1
+                    continue
+                if start_utc < import_start_utc or start_utc >= import_end_utc:
+                    continue
+                value = self._parse_non_negative_kwh(
+                    item.get("value"),
+                    prefix=prefix,
+                    label=f"import-hourly:{start_utc.isoformat()}",
+                )
+                if value is None:
+                    skipped_additional_invalid += 1
+                    continue
+                measurements_by_start[start_utc] = value
+                api_measurement_starts.add(start_utc)
+
+            total_measurements = len(measurements_by_start)
+            _LOGGER.debug(
+                "%s: consolidated current-month measurements total=%s fetched=%s preserved_existing=%s seed_skipped_outside_window=%s seed_skipped_unparsed=%s fetched_skipped_unparsed=%s fetched_skipped_missing=%s fetched_skipped_invalid=%s window=%s..%s",
+                prefix,
+                total_measurements,
+                fetched_count,
+                len(existing_month_values_by_start),
+                skipped_seed_before_window,
+                skipped_seed_unparsed,
+                skipped_additional_unparsed,
+                skipped_additional_missing,
+                skipped_additional_invalid,
+                import_start_utc,
+                import_end_utc,
+            )
+            if not measurements_by_start:
+                baseline_imported = not existing_month_values_by_start
+                if baseline_imported:
+                    await self._async_add_month_baseline_statistic(
+                        metadata=metadata,
+                        import_start_utc=import_start_utc,
+                        baseline_sum=baseline_sum,
+                    )
+                attrs = {
+                    **base_attrs,
+                    "last_update_success": True,
+                    "last_update_message": "Current-month API rows were returned but none were parseable",
+                    "current_month_hourly_rows": 0,
+                    "current_month_api_hourly_rows": 0,
+                    "current_month_preserved_existing_hours": len(existing_month_values_by_start),
+                    "current_month_baseline_imported": baseline_imported,
+                    "current_month_zero_filled_hours": 0,
+                    "current_month_imported_total_kwh": 0.0,
+                    "api_data_through": None,
+                    "hours_not_yet_available": max(
+                        0,
+                        int((import_end_utc - import_start_utc).total_seconds() // 3600),
+                    ),
+                }
+                self._state_callback(baseline_sum, attrs)
+                _LOGGER.debug(
+                    "%s: no hourly consumption data available after consolidation",
+                    prefix,
+                )
+                return
+
+            zero_filled_hours = await self._async_fill_confirmed_zero_hours(
                 prefix=prefix,
-                metadata=metadata,
+                measurements_by_start=measurements_by_start,
+                import_start_utc=import_start_utc,
                 today_utc=today_utc,
             )
 
-            # Re-read tail statistics in case monthly reconcile inserted points.
-            last_after_reconcile = await get_instance(self._hass).async_add_executor_job(
-                get_last_statistics,
-                self._hass,
-                1,
-                self._statistic_id,
-                True,
-                {STATISTIC_SUM},
+            # Diagnostic-only comparison to help identify discrepancies with official app totals.
+            await self._async_compare_hourly_vs_daily(
+                prefix=prefix,
+                measurements_by_start=measurements_by_start,
+                today_utc=today_utc,
             )
-            last_points_after = last_after_reconcile.get(self._statistic_id) or []
-            if last_points_after:
-                last_point = last_points_after[-1]
-                parsed_start = self._parse_stat_start(last_point.get("start"))
-                if parsed_start is not None:
-                    last_start = parsed_start
-                raw_sum = last_point.get("sum")
-                if raw_sum is None:
-                    raw_sum = last_point.get("state")
-                try:
-                    last_sum = float(raw_sum or 0.0)
-                except (TypeError, ValueError):
-                    pass
-                _LOGGER.debug(
-                    "%s: tail statistics refreshed after reconcile start=%s sum=%s",
-                    prefix,
-                    last_start,
-                    last_sum,
-                )
-                self._state_callback(last_sum)
 
             sorted_meas = sorted(measurements_by_start.items(), key=lambda item: item[0])
             _LOGGER.debug("%s: sorted measurements count=%s", prefix, len(sorted_meas))
 
             statistics = []
-            running_sum = last_sum
-            skipped_already_imported = 0
-            skipped_invalid_value = 0
+            running_sum = baseline_sum
+            imported_month_total = 0.0
 
-            for start_utc, m in sorted_meas:
-                if last_start is not None and start_utc <= last_start:
-                    skipped_already_imported += 1
-                    continue
-
-                val = self._parse_non_negative_kwh(
-                    m.get("value"),
-                    prefix=prefix,
-                    label=f"import-hourly:{start_utc.isoformat()}",
-                )
-                if val is None:
-                    skipped_invalid_value += 1
-                    continue
-
+            for start_utc, val in sorted_meas:
                 running_sum += val
+                imported_month_total += val
                 _LOGGER.debug(
                     "%s: prepared statistic start=%s value=%s running_sum=%s",
                     prefix,
@@ -1295,29 +1469,65 @@ class OctopusConsumptionStatisticsImporter:
                 })
 
             _LOGGER.debug(
-                "%s: post-filter counts prepared=%s skipped_already_imported=%s skipped_invalid_value=%s",
+                "%s: prepared current-month statistics count=%s imported_month_total=%.6f baseline_sum=%.6f final_sum=%.6f",
                 prefix,
                 len(statistics),
-                skipped_already_imported,
-                skipped_invalid_value,
+                imported_month_total,
+                baseline_sum,
+                running_sum,
             )
+
+            api_data_through = max(api_measurement_starts) if api_measurement_starts else None
+            last_imported_hour = sorted_meas[-1][0] if sorted_meas else None
+            if api_data_through is None:
+                hours_not_yet_available = max(
+                    0,
+                    int((import_end_utc - import_start_utc).total_seconds() // 3600),
+                )
+            else:
+                hours_not_yet_available = max(
+                    0,
+                    int(
+                        (
+                            import_end_utc
+                            - (api_data_through + timedelta(hours=1))
+                        ).total_seconds()
+                        // 3600
+                    ),
+                )
+
+            attrs = {
+                **base_attrs,
+                "last_update_success": True,
+                "last_update_message": "Current month statistics imported",
+                "current_month_hourly_rows": len(statistics),
+                "current_month_api_hourly_rows": len(api_measurement_starts),
+                "current_month_preserved_existing_hours": len(existing_month_values_by_start),
+                "current_month_baseline_imported": False,
+                "current_month_zero_filled_hours": zero_filled_hours,
+                "current_month_imported_total_kwh": round(imported_month_total, 6),
+                "api_data_through": api_data_through.isoformat() if api_data_through else None,
+                "hours_not_yet_available": hours_not_yet_available,
+                "last_imported_hour": last_imported_hour.isoformat() if last_imported_hour else None,
+                "last_imported_sum_kwh": round(running_sum, 6),
+            }
 
             if statistics:
                 _LOGGER.debug(
-                    "%s: adding external statistics metadata=%s statistics=%s",
+                    "%s: importing current-month statistics metadata=%s statistics=%s",
                     prefix,
                     metadata,
                     statistics,
                 )
                 await self._async_add_statistics(metadata, statistics)
-                self._state_callback(running_sum)
+                self._state_callback(running_sum, attrs)
                 _LOGGER.debug(
-                    "%s: added %d statistics entries",
+                    "%s: imported %d current-month statistics entries",
                     prefix,
                     len(statistics),
                 )
             else:
-                self._state_callback(running_sum)
+                self._state_callback(running_sum, attrs)
                 _LOGGER.debug("%s: no new statistics to add (running_sum=%s)", prefix, running_sum)
 
         except Exception as err:  # pylint: disable=broad-except
