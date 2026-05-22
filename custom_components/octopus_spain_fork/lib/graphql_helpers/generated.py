@@ -177,6 +177,7 @@ getMeasurements_QUERY = '''query getMeasurements(
   $startAt: DateTime!
   $endAt: DateTime!
   $utilityFilters: [UtilityFiltersInput!]
+  $timezone: String
 ) {
   account(accountNumber: $account) {
     properties {
@@ -186,7 +187,7 @@ getMeasurements_QUERY = '''query getMeasurements(
         utilityFilters: $utilityFilters
         startAt: $startAt
         endAt: $endAt
-        timezone: "Etc/GMT"
+        timezone: $timezone
       ) {
         edges {
           node {
@@ -209,6 +210,7 @@ class GetMeasurementsVariables:
     startAt: str
     endAt: str
     utilityFilters: list[UtilityFiltersInput] | None = None
+    timezone: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -217,6 +219,8 @@ class GetMeasurementsVariables:
         out['endAt'] = _serialize_input(self.endAt)
         if self.utilityFilters is not None:
             out['utilityFilters'] = _serialize_input(self.utilityFilters)
+        if self.timezone is not None:
+            out['timezone'] = _serialize_input(self.timezone)
         return out
 
 def build_get_measurements_request(variables: GetMeasurementsVariables | None = None) -> dict[str, Any]:

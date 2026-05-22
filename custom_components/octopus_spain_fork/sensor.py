@@ -614,6 +614,19 @@ class OctopusConsumptionStatisticsImporter:
             return dt_util.as_utc(value)
         return None
 
+    @staticmethod
+    def _local_day_start_utc(day: date) -> datetime:
+        timezone = dt_util.DEFAULT_TIME_ZONE or dt_util.UTC
+        return dt_util.as_utc(datetime.combine(day, time.min, tzinfo=timezone))
+
+    @staticmethod
+    def _local_date(value: datetime) -> date:
+        return dt_util.as_local(value).date()
+
+    @staticmethod
+    def _local_hour(value: datetime) -> int:
+        return dt_util.as_local(value).hour
+
     def _parse_non_negative_kwh(self, raw_value: Any, *, prefix: str, label: str) -> float | None:
         try:
             value = float(Decimal(raw_value))
@@ -656,15 +669,15 @@ class OctopusConsumptionStatisticsImporter:
         *,
         prefix: str,
         metadata: dict[str, Any],
-        today_utc: date,
+        today_local: date,
     ) -> None:
-        month_start_day = today_utc.replace(day=1)
-        complete_until = today_utc - timedelta(days=1)
+        month_start_day = today_local.replace(day=1)
+        complete_until = today_local - timedelta(days=1)
         if complete_until < month_start_day:
             return
 
-        range_start = datetime.combine(month_start_day, time.min, dt_util.UTC)
-        range_end = datetime.combine(complete_until + timedelta(days=1), time.min, dt_util.UTC)
+        range_start = self._local_day_start_utc(month_start_day)
+        range_end = self._local_day_start_utc(complete_until + timedelta(days=1))
         daily_rows = await self._coordinator.async_fetch_daily_consumption(
             self._account,
             range_start,
@@ -682,7 +695,7 @@ class OctopusConsumptionStatisticsImporter:
             parsed_start = dt_util.parse_datetime(start_at)
             if parsed_start is None:
                 continue
-            day = dt_util.as_utc(parsed_start).date()
+            day = self._local_date(dt_util.as_utc(parsed_start))
             if day < month_start_day or day > complete_until:
                 continue
             parsed_daily = self._parse_non_negative_kwh(
@@ -729,8 +742,8 @@ class OctopusConsumptionStatisticsImporter:
         reconciled_days = 0
 
         for day in sorted(daily_by_day):
-            day_start = datetime.combine(day, time.min, dt_util.UTC)
-            day_end = day_start + timedelta(days=1)
+            day_start = self._local_day_start_utc(day)
+            day_end = self._local_day_start_utc(day + timedelta(days=1))
 
             prev_sum = 0.0
             day_last_sum: float | None = None
@@ -788,8 +801,8 @@ class OctopusConsumptionStatisticsImporter:
         existing_points: list[tuple[datetime, float]],
         tolerance_kwh: float,
     ) -> bool:
-        day_start = datetime.combine(day, time.min, dt_util.UTC)
-        day_end = day_start + timedelta(days=1)
+        day_start = self._local_day_start_utc(day)
+        day_end = self._local_day_start_utc(day + timedelta(days=1))
         hourly_rows = await self._coordinator.async_fetch_hourly_consumption(
             self._account,
             day_start,
@@ -829,7 +842,7 @@ class OctopusConsumptionStatisticsImporter:
             )
             return False
 
-        present_hours = {dt.hour for dt in hourly_values}
+        present_hours = {self._local_hour(dt) for dt in hourly_values}
         missing_hours = sorted(set(range(24)) - present_hours)
         hourly_total = sum(hourly_values.values())
         if missing_hours and abs(api_day_total - hourly_total) <= tolerance_kwh:
@@ -922,14 +935,14 @@ class OctopusConsumptionStatisticsImporter:
         *,
         prefix: str,
         measurements_by_start: dict[datetime, Any],
-        today_utc: date,
+        today_local: date,
     ) -> None:
         """Compare hourly-summed totals with API daily totals for diagnostics."""
         if not measurements_by_start:
             return
 
         # We diagnose a recent complete window to avoid noisy partial-day mismatches.
-        complete_until = today_utc - timedelta(days=1)
+        complete_until = today_local - timedelta(days=1)
         compare_days = 7
         compare_start_day = complete_until - timedelta(days=compare_days - 1)
         if compare_start_day > complete_until:
@@ -938,7 +951,7 @@ class OctopusConsumptionStatisticsImporter:
         hourly_by_day: dict[date, float] = {}
         hours_seen_by_day: dict[date, set[int]] = {}
         for start_utc, item in measurements_by_start.items():
-            day = start_utc.date()
+            day = self._local_date(start_utc)
             if day < compare_start_day or day > complete_until:
                 continue
             raw_value = item.get("value") if isinstance(item, Mapping) else item
@@ -950,13 +963,13 @@ class OctopusConsumptionStatisticsImporter:
             if val is None:
                 continue
             hourly_by_day[day] = hourly_by_day.get(day, 0.0) + val
-            hours_seen_by_day.setdefault(day, set()).add(start_utc.hour)
+            hours_seen_by_day.setdefault(day, set()).add(self._local_hour(start_utc))
 
         if not hourly_by_day:
             return
 
-        range_start = datetime.combine(compare_start_day, time.min, dt_util.UTC)
-        range_end = datetime.combine(complete_until + timedelta(days=1), time.min, dt_util.UTC)
+        range_start = self._local_day_start_utc(compare_start_day)
+        range_end = self._local_day_start_utc(complete_until + timedelta(days=1))
         daily_rows = await self._coordinator.async_fetch_daily_consumption(
             self._account,
             range_start,
@@ -976,7 +989,7 @@ class OctopusConsumptionStatisticsImporter:
             start_at = _parse_start_at(row.get("startAt"))
             if start_at is None:
                 continue
-            day = start_at.date()
+            day = self._local_date(start_at)
             if day < compare_start_day or day > complete_until:
                 continue
             parsed_daily = self._parse_non_negative_kwh(
@@ -1130,19 +1143,19 @@ class OctopusConsumptionStatisticsImporter:
         prefix: str,
         measurements_by_start: dict[datetime, float],
         import_start_utc: datetime,
-        today_utc: date,
+        today_local: date,
     ) -> int:
         """Fill omitted zero-consumption hours only when daily totals confirm it."""
         if not measurements_by_start:
             return 0
 
-        complete_until = today_utc - timedelta(days=1)
-        range_start_day = import_start_utc.date()
+        complete_until = today_local - timedelta(days=1)
+        range_start_day = self._local_date(import_start_utc)
         if complete_until < range_start_day:
             return 0
 
-        range_start = datetime.combine(range_start_day, time.min, dt_util.UTC)
-        range_end = datetime.combine(complete_until + timedelta(days=1), time.min, dt_util.UTC)
+        range_start = self._local_day_start_utc(range_start_day)
+        range_end = self._local_day_start_utc(complete_until + timedelta(days=1))
         daily_rows = await self._coordinator.async_fetch_daily_consumption(
             self._account,
             range_start,
@@ -1154,7 +1167,7 @@ class OctopusConsumptionStatisticsImporter:
             start_utc = self._parse_api_start(row.get("startAt"))
             if start_utc is None:
                 continue
-            day = start_utc.date()
+            day = self._local_date(start_utc)
             if day < range_start_day or day > complete_until:
                 continue
             daily_value = self._parse_non_negative_kwh(
@@ -1172,14 +1185,14 @@ class OctopusConsumptionStatisticsImporter:
         tolerance_kwh = 0.05
         filled = 0
         for day, daily_total in sorted(daily_by_day.items()):
-            day_start = datetime.combine(day, time.min, dt_util.UTC)
+            day_start = self._local_day_start_utc(day)
             slots = [day_start + timedelta(hours=hour) for hour in range(24)]
             eligible_slots = [
                 slot for slot in slots if slot >= import_start_utc and slot in measurements_by_start
             ]
             if eligible_slots:
                 hourly_total = sum(measurements_by_start[slot] for slot in eligible_slots)
-                present_hours = {slot.hour for slot in eligible_slots}
+                present_hours = {self._local_hour(slot) for slot in eligible_slots}
                 missing_hours = sorted(set(range(24)) - present_hours)
             elif abs(daily_total) <= tolerance_kwh:
                 hourly_total = 0.0
@@ -1224,7 +1237,7 @@ class OctopusConsumptionStatisticsImporter:
             self._update_statistics_metadata()
 
             now_utc = dt_util.utcnow()
-            today_utc = now_utc.date()
+            today_local = dt_util.as_local(now_utc).date()
             import_start_utc, import_end_utc = self._month_import_window(now_utc)
             stats_window_hours = max(
                 1,
@@ -1332,8 +1345,7 @@ class OctopusConsumptionStatisticsImporter:
                 )
                 return
 
-            measurements_by_start: dict[datetime, float] = {}
-            measurements_by_start.update(existing_month_values_by_start)
+            api_measurements_by_start: dict[datetime, float] = {}
             api_measurement_starts: set[datetime] = set()
             skipped_seed_unparsed = 0
             skipped_seed_before_window = 0
@@ -1356,7 +1368,7 @@ class OctopusConsumptionStatisticsImporter:
                     )
                     if value is None:
                         continue
-                    measurements_by_start[start_utc] = value
+                    api_measurements_by_start[start_utc] = value
                     api_measurement_starts.add(start_utc)
 
             skipped_additional_unparsed = 0
@@ -1381,16 +1393,31 @@ class OctopusConsumptionStatisticsImporter:
                 if value is None:
                     skipped_additional_invalid += 1
                     continue
-                measurements_by_start[start_utc] = value
+                api_measurements_by_start[start_utc] = value
                 api_measurement_starts.add(start_utc)
+
+            api_data_through = max(api_measurement_starts) if api_measurement_starts else None
+            preserved_existing_values_by_start: dict[datetime, float] = {}
+            if api_data_through is not None:
+                for start_utc, value in existing_month_values_by_start.items():
+                    if start_utc > api_data_through:
+                        continue
+                    if start_utc in api_measurements_by_start:
+                        continue
+                    preserved_existing_values_by_start[start_utc] = value
+
+            measurements_by_start: dict[datetime, float] = {}
+            measurements_by_start.update(preserved_existing_values_by_start)
+            measurements_by_start.update(api_measurements_by_start)
 
             total_measurements = len(measurements_by_start)
             _LOGGER.debug(
-                "%s: consolidated current-month measurements total=%s fetched=%s preserved_existing=%s seed_skipped_outside_window=%s seed_skipped_unparsed=%s fetched_skipped_unparsed=%s fetched_skipped_missing=%s fetched_skipped_invalid=%s window=%s..%s",
+                "%s: consolidated current-month measurements total=%s fetched=%s preserved_existing=%s api_data_through=%s seed_skipped_outside_window=%s seed_skipped_unparsed=%s fetched_skipped_unparsed=%s fetched_skipped_missing=%s fetched_skipped_invalid=%s window=%s..%s",
                 prefix,
                 total_measurements,
                 fetched_count,
-                len(existing_month_values_by_start),
+                len(preserved_existing_values_by_start),
+                api_data_through.isoformat() if api_data_through else None,
                 skipped_seed_before_window,
                 skipped_seed_unparsed,
                 skipped_additional_unparsed,
@@ -1413,7 +1440,7 @@ class OctopusConsumptionStatisticsImporter:
                     "last_update_message": "Current-month API rows were returned but none were parseable",
                     "current_month_hourly_rows": 0,
                     "current_month_api_hourly_rows": 0,
-                    "current_month_preserved_existing_hours": len(existing_month_values_by_start),
+                    "current_month_preserved_existing_hours": len(preserved_existing_values_by_start),
                     "current_month_baseline_imported": baseline_imported,
                     "current_month_zero_filled_hours": 0,
                     "current_month_imported_total_kwh": 0.0,
@@ -1434,14 +1461,14 @@ class OctopusConsumptionStatisticsImporter:
                 prefix=prefix,
                 measurements_by_start=measurements_by_start,
                 import_start_utc=import_start_utc,
-                today_utc=today_utc,
+                today_local=today_local,
             )
 
             # Diagnostic-only comparison to help identify discrepancies with official app totals.
             await self._async_compare_hourly_vs_daily(
                 prefix=prefix,
                 measurements_by_start=measurements_by_start,
-                today_utc=today_utc,
+                today_local=today_local,
             )
 
             sorted_meas = sorted(measurements_by_start.items(), key=lambda item: item[0])
@@ -1477,7 +1504,6 @@ class OctopusConsumptionStatisticsImporter:
                 running_sum,
             )
 
-            api_data_through = max(api_measurement_starts) if api_measurement_starts else None
             last_imported_hour = sorted_meas[-1][0] if sorted_meas else None
             if api_data_through is None:
                 hours_not_yet_available = max(
@@ -1502,7 +1528,7 @@ class OctopusConsumptionStatisticsImporter:
                 "last_update_message": "Current month statistics imported",
                 "current_month_hourly_rows": len(statistics),
                 "current_month_api_hourly_rows": len(api_measurement_starts),
-                "current_month_preserved_existing_hours": len(existing_month_values_by_start),
+                "current_month_preserved_existing_hours": len(preserved_existing_values_by_start),
                 "current_month_baseline_imported": False,
                 "current_month_zero_filled_hours": zero_filled_hours,
                 "current_month_imported_total_kwh": round(imported_month_total, 6),

@@ -3,6 +3,7 @@ query getMeasurements(
   $startAt: DateTime!
   $endAt: DateTime!
   $utilityFilters: [UtilityFiltersInput!]
+  $timezone: String
 ) {
   account(accountNumber: $account) {
     properties {
@@ -12,7 +13,7 @@ query getMeasurements(
         utilityFilters: $utilityFilters
         startAt: $startAt
         endAt: $endAt
-        timezone: "Etc/GMT"
+        timezone: $timezone
       ) {
         edges {
           node {

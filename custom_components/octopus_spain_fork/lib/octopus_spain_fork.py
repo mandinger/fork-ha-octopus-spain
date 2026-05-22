@@ -123,12 +123,14 @@ class OctopusSpain:
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
     ):
+        api_timezone = self._api_timezone_name()
         query = """
             query getMeasurements(
                 $account: String!,
                 $startAt: DateTime!,
                 $endAt: DateTime!,
-                $utilityFilters: [UtilityFiltersInput!]
+                $utilityFilters: [UtilityFiltersInput!],
+                $timezone: String
                 ) {
                 account(accountNumber: $account) {
                     properties {
@@ -138,7 +140,7 @@ class OctopusSpain:
                         utilityFilters: $utilityFilters,
                         startAt: $startAt,
                         endAt: $endAt,
-                        timezone: "Etc/GMT"
+                        timezone: $timezone
                     ) {
                         edges {
                         node {
@@ -201,6 +203,7 @@ class OctopusSpain:
             "account": account,
             "startAt": to_utc_iso_z(start_utc),
             "endAt": to_utc_iso_z(end_utc),
+            "timezone": api_timezone,
             "utilityFilters": [
                 {
                     "electricityFilters": {
@@ -223,11 +226,12 @@ class OctopusSpain:
             return []
 
         _LOGGER.debug(
-            "%s consumption query for account %s executed. Start=%s End=%s",
+            "%s consumption query for account %s executed. Start=%s End=%s Timezone=%s",
             reading_frequency_type,
             account,
             variables["startAt"],
             variables["endAt"],
+            api_timezone,
         )
 
         props = response.get("data", {}).get("account", {}).get("properties", [])
@@ -272,6 +276,17 @@ class OctopusSpain:
             }
             for edge in edges
         ]
+
+    @staticmethod
+    def _api_timezone_name() -> str:
+        """Return the IANA timezone name to request measurements in."""
+        default_tz = getattr(dt_util, "DEFAULT_TIME_ZONE", None)
+        timezone_name = getattr(default_tz, "key", None)
+        if not timezone_name and default_tz is not None:
+            timezone_name = str(default_tz)
+        if not timezone_name:
+            return "Etc/GMT"
+        return timezone_name.replace('"', "")
 
     async def account(self, account: str):
         # Ensure we're authenticated (mirror logic from hourly_consumption)
