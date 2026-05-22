@@ -505,13 +505,12 @@ class OctopusConsumptionStatisticsImporter:
         self._account = account
         self._single = single
         self._state_callback = state_callback
-        safe_account = _account_slug(account)
         self._statistic_id = statistic_id
-        self._legacy_statistic_id = f"{DOMAIN}:energy_consumption_{safe_account}"
-        self._default_entity_statistic_id = f"sensor.consumo_electrico_{safe_account}"
         self._name = _account_name("Consumo Electrico", account)
         self._remove_listener: Callable[[], None] | None = None
+        self._metadata_updated = False
         self._reconcile_warning_fingerprint_by_day: dict[date, tuple[int, float, float]] = {}
+        self._current_month_mismatch_fingerprint: tuple[int, float] | None = None
         self._negative_consumption_fingerprints: set[str] = set()
 
     async def async_setup(self) -> None:
@@ -529,49 +528,13 @@ class OctopusConsumptionStatisticsImporter:
         """Schedule processing for the latest coordinator data."""
         self._hass.async_create_task(self._async_process_update())
 
-    def _update_statistics_metadata(self) -> None:
-        """Ensure existing recorder metadata is classified as energy."""
-        if async_update_statistics_metadata is None:
+    async def _async_update_statistics_metadata(self) -> None:
+        """Ensure the active recorder metadata is classified as energy."""
+        if self._metadata_updated:
             return
-        legacy_statistic_ids = {
-            self._legacy_statistic_id,
-            self._default_entity_statistic_id,
-        }
-        if self._single:
-            legacy_statistic_ids.add("sensor.consumo_electrico")
-        for legacy_statistic_id in legacy_statistic_ids:
-            if legacy_statistic_id == self._statistic_id:
-                continue
-            try:
-                async_update_statistics_metadata(
-                    self._hass,
-                    legacy_statistic_id,
-                    new_statistic_id=self._statistic_id,
-                    new_unit_class=ENERGY_UNIT_CLASS,
-                    new_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-                )
-            except TypeError:
-                try:
-                    async_update_statistics_metadata(
-                        self._hass,
-                        legacy_statistic_id,
-                        new_statistic_id=self._statistic_id,
-                        new_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-                    )
-                except Exception as err:  # pragma: no cover - best-effort metadata repair
-                    _LOGGER.debug(
-                        "%s: unable to migrate statistic metadata to %s: %s",
-                        legacy_statistic_id,
-                        self._statistic_id,
-                        err,
-                    )
-            except Exception as err:  # pragma: no cover - best-effort metadata repair
-                _LOGGER.debug(
-                    "%s: unable to migrate statistic metadata to %s: %s",
-                    legacy_statistic_id,
-                    self._statistic_id,
-                    err,
-                )
+        if async_update_statistics_metadata is None:
+            self._metadata_updated = True
+            return
         try:
             async_update_statistics_metadata(
                 self._hass,
@@ -598,6 +561,7 @@ class OctopusConsumptionStatisticsImporter:
                 self._statistic_id,
                 err,
             )
+        self._metadata_updated = True
 
     @staticmethod
     def _parse_stat_start(value: Any) -> datetime | None:
@@ -1234,7 +1198,7 @@ class OctopusConsumptionStatisticsImporter:
                 type(measurements_raw).__name__,
             )
 
-            self._update_statistics_metadata()
+            await self._async_update_statistics_metadata()
 
             now_utc = dt_util.utcnow()
             today_local = dt_util.as_local(now_utc).date()
@@ -1253,6 +1217,7 @@ class OctopusConsumptionStatisticsImporter:
             last_sum = 0.0
             existing_month_points = 0
             existing_month_values_by_start: dict[datetime, float] = {}
+            existing_month_sums_by_start: dict[datetime, float] = {}
             previous_sum = 0.0
             for point_start, point_sum in existing_points:
                 last_start = point_start
@@ -1264,6 +1229,7 @@ class OctopusConsumptionStatisticsImporter:
                 else:
                     existing_month_points += 1
                     if point_start < import_end_utc:
+                        existing_month_sums_by_start[point_start] = point_sum
                         existing_value = point_sum - previous_sum
                         if existing_value >= 0:
                             existing_month_values_by_start[point_start] = existing_value
@@ -1477,6 +1443,10 @@ class OctopusConsumptionStatisticsImporter:
             statistics = []
             running_sum = baseline_sum
             imported_month_total = 0.0
+            reused_existing_points = 0
+            mismatched_existing_points = 0
+            max_existing_delta = 0.0
+            sum_tolerance_kwh = 0.001
 
             for start_utc, val in sorted_meas:
                 running_sum += val
@@ -1488,6 +1458,16 @@ class OctopusConsumptionStatisticsImporter:
                     val,
                     running_sum,
                 )
+
+                existing_sum = existing_month_sums_by_start.get(start_utc)
+                if existing_sum is not None:
+                    reused_existing_points += 1
+                    point_delta = abs(existing_sum - running_sum)
+                    if point_delta > sum_tolerance_kwh:
+                        mismatched_existing_points += 1
+                        if point_delta > max_existing_delta:
+                            max_existing_delta = point_delta
+                    continue
 
                 statistics.append({
                     "start": start_utc,
@@ -1503,6 +1483,32 @@ class OctopusConsumptionStatisticsImporter:
                 baseline_sum,
                 running_sum,
             )
+            if reused_existing_points:
+                _LOGGER.debug(
+                    "%s: skipped %s recorder statistic point(s) that already exist for the current month",
+                    prefix,
+                    reused_existing_points,
+                )
+            if mismatched_existing_points:
+                fingerprint = (
+                    mismatched_existing_points,
+                    round(max_existing_delta, 3),
+                )
+                if self._current_month_mismatch_fingerprint != fingerprint:
+                    self._current_month_mismatch_fingerprint = fingerprint
+                    _LOGGER.warning(
+                        "%s: reconstructed current-month totals differ from %s existing recorder point(s) (max_delta=%.3f kWh). Existing points are left untouched to avoid duplicate accumulation.",
+                        prefix,
+                        mismatched_existing_points,
+                        max_existing_delta,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "%s: current-month mismatch fingerprint unchanged (%s point(s), max_delta=%.3f kWh)",
+                        prefix,
+                        mismatched_existing_points,
+                        max_existing_delta,
+                    )
 
             last_imported_hour = sorted_meas[-1][0] if sorted_meas else None
             if api_data_through is None:
@@ -1525,9 +1531,11 @@ class OctopusConsumptionStatisticsImporter:
             attrs = {
                 **base_attrs,
                 "last_update_success": True,
-                "last_update_message": "Current month statistics imported",
-                "current_month_hourly_rows": len(statistics),
+                "last_update_message": "Current month statistics synchronized",
+                "current_month_hourly_rows": len(sorted_meas),
                 "current_month_api_hourly_rows": len(api_measurement_starts),
+                "current_month_new_statistics_rows": len(statistics),
+                "current_month_existing_statistics_rows": reused_existing_points,
                 "current_month_preserved_existing_hours": len(preserved_existing_values_by_start),
                 "current_month_baseline_imported": False,
                 "current_month_zero_filled_hours": zero_filled_hours,
