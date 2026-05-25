@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, time, timezone
 import logging
 import os
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 from python_graphql_client import GraphqlClient
 from homeassistant.util import dt as dt_util
@@ -11,6 +12,29 @@ SOLAR_WALLET_LEDGER = "SOLAR_WALLET_LEDGER"
 ELECTRICITY_LEDGER = "SPAIN_ELECTRICITY_LEDGER"
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _parse_presigned_url_expiry(url: Optional[str]) -> Optional[str]:
+    """Return the UTC expiration timestamp for a presigned URL."""
+    if not url:
+        return None
+
+    try:
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        issued_raw = query.get("X-Amz-Date", [None])[0]
+        expires_raw = query.get("X-Amz-Expires", [None])[0]
+        if not issued_raw or not expires_raw:
+            return None
+
+        issued_at = datetime.strptime(issued_raw, "%Y%m%dT%H%M%SZ").replace(
+            tzinfo=timezone.utc
+        )
+        expires_at = issued_at + timedelta(seconds=int(expires_raw))
+        return expires_at.isoformat()
+    except (TypeError, ValueError):
+        _LOGGER.debug("Unable to parse presigned URL expiry from %s", url, exc_info=True)
+        return None
 
 
 class OctopusSpain:
@@ -311,6 +335,7 @@ class OctopusSpain:
                         'issued': None,
                         'earliest_charge_at': None,
                         'pdf': None,
+                        'pdf_expires_at': None,
                         'id': None,
                         # Legacy fields kept for compatibility
                         'start': None,
@@ -420,6 +445,7 @@ class OctopusSpain:
                     'issued': None,
                     'earliest_charge_at': None,
                     'pdf': None,
+                    'pdf_expires_at': None,
                     'id': None,
                     # Legacy fields kept for compatibility
                     'start': None,
@@ -462,6 +488,7 @@ class OctopusSpain:
                 "issued": parse_iso_date(invoice.get("firstIssued")),
                 "earliest_charge_at": parse_iso_date(invoice.get("earliestChargeAt")),
                 "pdf": invoice.get("pdfUrl"),
+                "pdf_expires_at": _parse_presigned_url_expiry(invoice.get("pdfUrl")),
                 "id": invoice.get("id"),
             },
         }

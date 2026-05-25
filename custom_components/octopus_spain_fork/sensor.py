@@ -45,6 +45,7 @@ from .runtime import OctopusSpainConfigEntry
 _LOGGER = logging.getLogger(__name__)
 
 ENERGY_UNIT_CLASS = "energy"
+PDF_URL_REFRESH_BUFFER = timedelta(minutes=5)
 
 
 def _account_slug(account: str) -> str:
@@ -55,6 +56,26 @@ def _account_slug(account: str) -> str:
 def _account_name(name: str, account: str) -> str:
     """Return a display name scoped to an Octopus account."""
     return f"{name} ({account})"
+
+
+def _parse_invoice_pdf_expiry(invoice: Mapping[str, Any]) -> datetime | None:
+    """Return the parsed PDF URL expiration timestamp in UTC."""
+    raw_value = invoice.get("pdf_expires_at")
+    if not raw_value:
+        return None
+
+    parsed = dt_util.parse_datetime(str(raw_value))
+    if parsed is None:
+        return None
+    return dt_util.as_utc(parsed)
+
+
+def _invoice_pdf_status(invoice: Mapping[str, Any]) -> tuple[datetime | None, bool]:
+    """Return the PDF expiry and whether the current URL is expired."""
+    expires_at = _parse_invoice_pdf_expiry(invoice)
+    if expires_at is None:
+        return None, False
+    return expires_at, expires_at <= dt_util.utcnow()
 
 
 async def async_setup_entry(
@@ -212,12 +233,49 @@ class OctopusWallet(CoordinatorEntity[OctopusCoordinator], SensorEntity):
         return self._state
 
 
-class OctopusInvoice(CoordinatorEntity[OctopusCoordinator], SensorEntity):
+class _InvoiceRefreshMixin(CoordinatorEntity[OctopusCoordinator]):
+    """Shared helpers for invoice entities with expiring PDF URLs."""
+
+    _account: str
+    _pdf_refresh_requested: bool
+
+    def _maybe_refresh_invoice_pdf(self, invoice: Mapping[str, Any], prefix: str) -> None:
+        pdf_url = invoice.get("pdf")
+        expires_at = _parse_invoice_pdf_expiry(invoice)
+        if not pdf_url or expires_at is None:
+            return
+        if expires_at > dt_util.utcnow() + PDF_URL_REFRESH_BUFFER:
+            self._pdf_refresh_requested = False
+            return
+        if self._pdf_refresh_requested:
+            return
+
+        self._pdf_refresh_requested = True
+        _LOGGER.debug(
+            "%s: PDF URL expires at %s, requesting an invoice refresh",
+            prefix,
+            expires_at.isoformat(),
+        )
+        self.hass.async_create_task(self._async_refresh_invoice_pdf())
+
+    async def _async_refresh_invoice_pdf(self) -> None:
+        try:
+            await self.coordinator.async_refresh_account_invoice(self._account)
+        finally:
+            self._pdf_refresh_requested = False
+
+    async def async_update(self) -> None:
+        """Allow manual entity refresh to fetch a fresh signed PDF URL."""
+        await self.coordinator.async_refresh_account_invoice(self._account)
+
+
+class OctopusInvoice(_InvoiceRefreshMixin, SensorEntity):
 
     def __init__(self, account: str, coordinator: OctopusCoordinator, single: bool) -> None:
         super().__init__(coordinator=coordinator)
         self._state = None
         self._account = account
+        self._pdf_refresh_requested = False
         safe_account = _account_slug(account)
         self._attrs: Mapping[str, Any] = {}
         self._attr_name = _account_name("Última Factura Octopus", account)
@@ -255,6 +313,9 @@ class OctopusInvoice(CoordinatorEntity[OctopusCoordinator], SensorEntity):
                 self.async_write_ha_state()
                 return
 
+            self._maybe_refresh_invoice_pdf(inv, prefix)
+            pdf_expires_at, pdf_is_expired = _invoice_pdf_status(inv)
+
             # Determine the best amount field to use for state
             amount = (
                 inv.get('amount')
@@ -289,6 +350,8 @@ class OctopusInvoice(CoordinatorEntity[OctopusCoordinator], SensorEntity):
                 'Importe facturado': inv.get('invoiced_amount'),
                 'ID': inv.get('id'),
                 'PDF': inv.get('pdf'),
+                'PDF caduca': pdf_expires_at.isoformat() if pdf_expires_at else None,
+                'PDF expirada': pdf_is_expired,
             }
 
             _LOGGER.debug(
@@ -310,7 +373,7 @@ class OctopusInvoice(CoordinatorEntity[OctopusCoordinator], SensorEntity):
         return self._attrs
 
 
-class OctopusInvoiceFieldSensor(CoordinatorEntity[OctopusCoordinator], SensorEntity):
+class OctopusInvoiceFieldSensor(_InvoiceRefreshMixin, SensorEntity):
     """Expose individual fields from last_invoice as separate sensors."""
 
     def __init__(
@@ -327,6 +390,7 @@ class OctopusInvoiceFieldSensor(CoordinatorEntity[OctopusCoordinator], SensorEnt
         super().__init__(coordinator=coordinator)
         self._state: StateType = None
         self._account = account
+        self._pdf_refresh_requested = False
         self._field = field
         safe_account = _account_slug(account)
         safe_field = slugify(field)
@@ -366,6 +430,8 @@ class OctopusInvoiceFieldSensor(CoordinatorEntity[OctopusCoordinator], SensorEnt
                 return
 
             inv = account_data.get("last_invoice") or {}
+            if self._field == "pdf":
+                self._maybe_refresh_invoice_pdf(inv, prefix)
             raw = inv.get(self._field)
             # Handle date device class: needs date/datetime, not string
             if (
@@ -396,9 +462,14 @@ class OctopusInvoiceFieldSensor(CoordinatorEntity[OctopusCoordinator], SensorEnt
                 # Non-numeric/text fields. Special-case long PDF URLs (state limit 255)
                 if self._field == "pdf":
                     url = str(raw) if raw is not None else None
-                    self._attrs = {"url": url} if url else {}
+                    expires_at, is_expired = _invoice_pdf_status(inv)
+                    self._attrs = {
+                        "url": url,
+                        "expires_at": expires_at.isoformat() if expires_at else None,
+                        "is_expired": is_expired,
+                    } if url else {}
                     # keep state short and indicative
-                    self._state = "available" if url else None
+                    self._state = "expired" if is_expired else "available" if url else None
                 else:
                     self._state = raw if raw is not None else None
 

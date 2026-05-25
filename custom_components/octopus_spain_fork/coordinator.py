@@ -26,6 +26,7 @@ class OctopusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._api = OctopusSpain(email, password, api_key)
         self._data: dict[str, Any] = {}
+        self._invoice_refreshing_accounts: set[str] = set()
 
     async def _async_update_data(self) -> dict[str, Any]:
         if await self._api.login():
@@ -69,3 +70,27 @@ class OctopusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> list[dict[str, Any]]:
         """Fetch daily consumption for a specific range."""
         return await self._api.daily_consumption(account, start=start, end=end)
+
+    async def async_refresh_account_invoice(self, account: str) -> bool:
+        """Refresh billing data for a single account without reloading consumption."""
+        if account in self._invoice_refreshing_accounts:
+            return False
+
+        self._invoice_refreshing_accounts.add(account)
+        try:
+            refreshed = await self._api.account(account)
+            if not refreshed:
+                return False
+
+            current = self._data.get(account, {})
+            merged = {**current, **refreshed}
+            if "hourly_consumption" in current and "hourly_consumption" not in merged:
+                merged["hourly_consumption"] = current["hourly_consumption"]
+
+            new_data = dict(self._data)
+            new_data[account] = merged
+            self._data = new_data
+            self.async_set_updated_data(new_data)
+            return True
+        finally:
+            self._invoice_refreshing_accounts.discard(account)
