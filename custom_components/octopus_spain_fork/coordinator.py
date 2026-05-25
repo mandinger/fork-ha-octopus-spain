@@ -8,7 +8,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from .const import UPDATE_INTERVAL
+from .const import CONSUMPTION_IMPORT_DELAY_DAYS, UPDATE_INTERVAL
 from .lib.octopus_spain_fork import OctopusSpain
 
 _LOGGER = logging.getLogger(__name__)
@@ -35,10 +35,11 @@ class OctopusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 acc = await self._api.account(account)
                 if "hourly_consumption" not in acc:
                     hourly_consumption: list[dict[str, Any]] = []
-                    today = dt_util.utcnow().date()
-                    start_day = today - timedelta(days=2)
+                    today = dt_util.as_local(dt_util.utcnow()).date()
+                    end_day = today - timedelta(days=CONSUMPTION_IMPORT_DELAY_DAYS)
+                    start_day = end_day - timedelta(days=2)
                     day_cursor = start_day
-                    while day_cursor <= today:
+                    while day_cursor < end_day:
                         day_start = datetime.combine(day_cursor, time.min, dt_util.UTC)
                         day_end = day_start + timedelta(days=1)
                         fetched = await self._api.hourly_consumption(
