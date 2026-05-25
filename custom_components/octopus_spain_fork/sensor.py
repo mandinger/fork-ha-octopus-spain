@@ -38,13 +38,14 @@ try:
     from homeassistant.components.recorder.statistics import async_update_statistics_metadata
 except ImportError:  # pragma: no cover - older Home Assistant versions
     async_update_statistics_metadata = None
-from .const import DOMAIN
+from .const import CONSUMPTION_IMPORT_DELAY_DAYS, DOMAIN
 from .coordinator import OctopusCoordinator
 from .runtime import OctopusSpainConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
 ENERGY_UNIT_CLASS = "energy"
+PDF_URL_REFRESH_BUFFER = timedelta(minutes=5)
 
 
 def _account_slug(account: str) -> str:
@@ -55,6 +56,26 @@ def _account_slug(account: str) -> str:
 def _account_name(name: str, account: str) -> str:
     """Return a display name scoped to an Octopus account."""
     return f"{name} ({account})"
+
+
+def _parse_invoice_pdf_expiry(invoice: Mapping[str, Any]) -> datetime | None:
+    """Return the parsed PDF URL expiration timestamp in UTC."""
+    raw_value = invoice.get("pdf_expires_at")
+    if not raw_value:
+        return None
+
+    parsed = dt_util.parse_datetime(str(raw_value))
+    if parsed is None:
+        return None
+    return dt_util.as_utc(parsed)
+
+
+def _invoice_pdf_status(invoice: Mapping[str, Any]) -> tuple[datetime | None, bool]:
+    """Return the PDF expiry and whether the current URL is expired."""
+    expires_at = _parse_invoice_pdf_expiry(invoice)
+    if expires_at is None:
+        return None, False
+    return expires_at, expires_at <= dt_util.utcnow()
 
 
 async def async_setup_entry(
@@ -212,12 +233,49 @@ class OctopusWallet(CoordinatorEntity[OctopusCoordinator], SensorEntity):
         return self._state
 
 
-class OctopusInvoice(CoordinatorEntity[OctopusCoordinator], SensorEntity):
+class _InvoiceRefreshMixin(CoordinatorEntity[OctopusCoordinator]):
+    """Shared helpers for invoice entities with expiring PDF URLs."""
+
+    _account: str
+    _pdf_refresh_requested: bool
+
+    def _maybe_refresh_invoice_pdf(self, invoice: Mapping[str, Any], prefix: str) -> None:
+        pdf_url = invoice.get("pdf")
+        expires_at = _parse_invoice_pdf_expiry(invoice)
+        if not pdf_url or expires_at is None:
+            return
+        if expires_at > dt_util.utcnow() + PDF_URL_REFRESH_BUFFER:
+            self._pdf_refresh_requested = False
+            return
+        if self._pdf_refresh_requested:
+            return
+
+        self._pdf_refresh_requested = True
+        _LOGGER.debug(
+            "%s: PDF URL expires at %s, requesting an invoice refresh",
+            prefix,
+            expires_at.isoformat(),
+        )
+        self.hass.async_create_task(self._async_refresh_invoice_pdf())
+
+    async def _async_refresh_invoice_pdf(self) -> None:
+        try:
+            await self.coordinator.async_refresh_account_invoice(self._account)
+        finally:
+            self._pdf_refresh_requested = False
+
+    async def async_update(self) -> None:
+        """Allow manual entity refresh to fetch a fresh signed PDF URL."""
+        await self.coordinator.async_refresh_account_invoice(self._account)
+
+
+class OctopusInvoice(_InvoiceRefreshMixin, SensorEntity):
 
     def __init__(self, account: str, coordinator: OctopusCoordinator, single: bool) -> None:
         super().__init__(coordinator=coordinator)
         self._state = None
         self._account = account
+        self._pdf_refresh_requested = False
         safe_account = _account_slug(account)
         self._attrs: Mapping[str, Any] = {}
         self._attr_name = _account_name("Última Factura Octopus", account)
@@ -255,6 +313,9 @@ class OctopusInvoice(CoordinatorEntity[OctopusCoordinator], SensorEntity):
                 self.async_write_ha_state()
                 return
 
+            self._maybe_refresh_invoice_pdf(inv, prefix)
+            pdf_expires_at, pdf_is_expired = _invoice_pdf_status(inv)
+
             # Determine the best amount field to use for state
             amount = (
                 inv.get('amount')
@@ -289,6 +350,8 @@ class OctopusInvoice(CoordinatorEntity[OctopusCoordinator], SensorEntity):
                 'Importe facturado': inv.get('invoiced_amount'),
                 'ID': inv.get('id'),
                 'PDF': inv.get('pdf'),
+                'PDF caduca': pdf_expires_at.isoformat() if pdf_expires_at else None,
+                'PDF expirada': pdf_is_expired,
             }
 
             _LOGGER.debug(
@@ -310,7 +373,7 @@ class OctopusInvoice(CoordinatorEntity[OctopusCoordinator], SensorEntity):
         return self._attrs
 
 
-class OctopusInvoiceFieldSensor(CoordinatorEntity[OctopusCoordinator], SensorEntity):
+class OctopusInvoiceFieldSensor(_InvoiceRefreshMixin, SensorEntity):
     """Expose individual fields from last_invoice as separate sensors."""
 
     def __init__(
@@ -327,6 +390,7 @@ class OctopusInvoiceFieldSensor(CoordinatorEntity[OctopusCoordinator], SensorEnt
         super().__init__(coordinator=coordinator)
         self._state: StateType = None
         self._account = account
+        self._pdf_refresh_requested = False
         self._field = field
         safe_account = _account_slug(account)
         safe_field = slugify(field)
@@ -366,6 +430,8 @@ class OctopusInvoiceFieldSensor(CoordinatorEntity[OctopusCoordinator], SensorEnt
                 return
 
             inv = account_data.get("last_invoice") or {}
+            if self._field == "pdf":
+                self._maybe_refresh_invoice_pdf(inv, prefix)
             raw = inv.get(self._field)
             # Handle date device class: needs date/datetime, not string
             if (
@@ -396,9 +462,14 @@ class OctopusInvoiceFieldSensor(CoordinatorEntity[OctopusCoordinator], SensorEnt
                 # Non-numeric/text fields. Special-case long PDF URLs (state limit 255)
                 if self._field == "pdf":
                     url = str(raw) if raw is not None else None
-                    self._attrs = {"url": url} if url else {}
+                    expires_at, is_expired = _invoice_pdf_status(inv)
+                    self._attrs = {
+                        "url": url,
+                        "expires_at": expires_at.isoformat() if expires_at else None,
+                        "is_expired": is_expired,
+                    } if url else {}
                     # keep state short and indicative
-                    self._state = "available" if url else None
+                    self._state = "expired" if is_expired else "available" if url else None
                 else:
                     self._state = raw if raw is not None else None
 
@@ -899,14 +970,14 @@ class OctopusConsumptionStatisticsImporter:
         *,
         prefix: str,
         measurements_by_start: dict[datetime, Any],
-        today_local: date,
+        import_end_utc: datetime,
     ) -> None:
         """Compare hourly-summed totals with API daily totals for diagnostics."""
         if not measurements_by_start:
             return
 
         # We diagnose a recent complete window to avoid noisy partial-day mismatches.
-        complete_until = today_local - timedelta(days=1)
+        complete_until = self._local_date(import_end_utc - timedelta(hours=1))
         compare_days = 7
         compare_start_day = complete_until - timedelta(days=compare_days - 1)
         if compare_start_day > complete_until:
@@ -1041,15 +1112,62 @@ class OctopusConsumptionStatisticsImporter:
 
     @staticmethod
     def _month_import_window(now_utc: datetime) -> tuple[datetime, datetime]:
-        """Return the Home Assistant-local current month window in UTC."""
+        """Return the delayed Home Assistant-local current month window in UTC."""
         now_local = dt_util.as_local(now_utc)
         month_start_local = now_local.replace(
             day=1, hour=0, minute=0, second=0, microsecond=0
         )
-        next_day_local = (now_local + timedelta(days=1)).replace(
+        delayed_end_local = (now_local - timedelta(days=CONSUMPTION_IMPORT_DELAY_DAYS)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        return dt_util.as_utc(month_start_local), dt_util.as_utc(next_day_local)
+        if delayed_end_local < month_start_local:
+            delayed_end_local = month_start_local
+        return dt_util.as_utc(month_start_local), dt_util.as_utc(delayed_end_local)
+
+    def _local_day_hour_starts(self, day: date) -> list[datetime]:
+        """Return expected hourly interval starts for a local day in UTC."""
+        day_start = self._local_day_start_utc(day)
+        day_end = self._local_day_start_utc(day + timedelta(days=1))
+        expected_hours = int((day_end - day_start).total_seconds() // 3600)
+        return [day_start + timedelta(hours=hour) for hour in range(expected_hours)]
+
+    def _truncate_incomplete_days(
+        self,
+        *,
+        prefix: str,
+        measurements_by_start: dict[datetime, float],
+    ) -> tuple[dict[datetime, float], date | None]:
+        """Skip the first incomplete local day and every day after it."""
+        if not measurements_by_start:
+            return measurements_by_start, None
+
+        days = sorted({self._local_date(start_utc) for start_utc in measurements_by_start})
+        for day in days:
+            expected_starts = self._local_day_hour_starts(day)
+            missing_starts = [
+                start_utc for start_utc in expected_starts if start_utc not in measurements_by_start
+            ]
+            if not missing_starts:
+                continue
+
+            day_start = self._local_day_start_utc(day)
+            kept_measurements = {
+                start_utc: value
+                for start_utc, value in measurements_by_start.items()
+                if start_utc < day_start
+            }
+            missing_hours = [dt_util.as_local(start_utc).hour for start_utc in missing_starts]
+            _LOGGER.warning(
+                "%s: incomplete hourly data detected on %s (hours_seen=%s/%s, missing_hours=%s); skipping that day and all following days",
+                prefix,
+                day.isoformat(),
+                len(expected_starts) - len(missing_starts),
+                len(expected_starts),
+                missing_hours,
+            )
+            return kept_measurements, day
+
+        return measurements_by_start, None
 
     @staticmethod
     def _parse_stat_sum(point: Mapping[str, Any]) -> float | None:
@@ -1201,7 +1319,6 @@ class OctopusConsumptionStatisticsImporter:
             await self._async_update_statistics_metadata()
 
             now_utc = dt_util.utcnow()
-            today_local = dt_util.as_local(now_utc).date()
             import_start_utc, import_end_utc = self._month_import_window(now_utc)
             stats_window_hours = max(
                 1,
@@ -1253,6 +1370,7 @@ class OctopusConsumptionStatisticsImporter:
                 "current_month_start": dt_util.as_local(import_start_utc).isoformat(),
                 "current_month_start_utc": import_start_utc.isoformat(),
                 "import_window_end_utc": import_end_utc.isoformat(),
+                "import_delay_days": CONSUMPTION_IMPORT_DELAY_DAYS,
                 "baseline_hour": baseline_start.isoformat() if baseline_start else None,
                 "baseline_sum_kwh": round(baseline_sum, 6),
                 "previous_last_imported_hour": last_start.isoformat() if last_start else None,
@@ -1372,11 +1490,33 @@ class OctopusConsumptionStatisticsImporter:
                         continue
                     preserved_existing_values_by_start[start_utc] = value
 
+            api_measurements_by_start, truncated_from_day = self._truncate_incomplete_days(
+                prefix=prefix,
+                measurements_by_start=api_measurements_by_start,
+            )
+            if truncated_from_day is not None:
+                preserved_existing_values_by_start = {
+                    start_utc: value
+                    for start_utc, value in preserved_existing_values_by_start.items()
+                    if self._local_date(start_utc) < truncated_from_day
+                }
+                api_measurement_starts = {
+                    start_utc
+                    for start_utc in api_measurement_starts
+                    if self._local_date(start_utc) < truncated_from_day
+                }
+                api_measurements_by_start = {
+                    start_utc: value
+                    for start_utc, value in api_measurements_by_start.items()
+                    if self._local_date(start_utc) < truncated_from_day
+                }
+
             measurements_by_start: dict[datetime, float] = {}
             measurements_by_start.update(preserved_existing_values_by_start)
             measurements_by_start.update(api_measurements_by_start)
 
             total_measurements = len(measurements_by_start)
+            api_data_through = max(api_measurement_starts) if api_measurement_starts else None
             _LOGGER.debug(
                 "%s: consolidated current-month measurements total=%s fetched=%s preserved_existing=%s api_data_through=%s seed_skipped_outside_window=%s seed_skipped_unparsed=%s fetched_skipped_unparsed=%s fetched_skipped_missing=%s fetched_skipped_invalid=%s window=%s..%s",
                 prefix,
@@ -1393,7 +1533,7 @@ class OctopusConsumptionStatisticsImporter:
                 import_end_utc,
             )
             if not measurements_by_start:
-                baseline_imported = not existing_month_values_by_start
+                baseline_imported = not preserved_existing_values_by_start
                 if baseline_imported:
                     await self._async_add_month_baseline_statistic(
                         metadata=metadata,
@@ -1403,7 +1543,12 @@ class OctopusConsumptionStatisticsImporter:
                 attrs = {
                     **base_attrs,
                     "last_update_success": True,
-                    "last_update_message": "Current-month API rows were returned but none were parseable",
+                    "last_update_message": (
+                        f"Incomplete hourly data detected from {truncated_from_day.isoformat()}; "
+                        "skipped that day and later"
+                        if truncated_from_day is not None
+                        else "Current-month API rows were returned but none were parseable"
+                    ),
                     "current_month_hourly_rows": 0,
                     "current_month_api_hourly_rows": 0,
                     "current_month_preserved_existing_hours": len(preserved_existing_values_by_start),
@@ -1411,6 +1556,7 @@ class OctopusConsumptionStatisticsImporter:
                     "current_month_zero_filled_hours": 0,
                     "current_month_imported_total_kwh": 0.0,
                     "api_data_through": None,
+                    "truncated_from_day": truncated_from_day.isoformat() if truncated_from_day else None,
                     "hours_not_yet_available": max(
                         0,
                         int((import_end_utc - import_start_utc).total_seconds() // 3600),
@@ -1423,18 +1569,13 @@ class OctopusConsumptionStatisticsImporter:
                 )
                 return
 
-            zero_filled_hours = await self._async_fill_confirmed_zero_hours(
-                prefix=prefix,
-                measurements_by_start=measurements_by_start,
-                import_start_utc=import_start_utc,
-                today_local=today_local,
-            )
+            zero_filled_hours = 0
 
             # Diagnostic-only comparison to help identify discrepancies with official app totals.
             await self._async_compare_hourly_vs_daily(
                 prefix=prefix,
                 measurements_by_start=measurements_by_start,
-                today_local=today_local,
+                import_end_utc=import_end_utc,
             )
 
             sorted_meas = sorted(measurements_by_start.items(), key=lambda item: item[0])
@@ -1531,7 +1672,11 @@ class OctopusConsumptionStatisticsImporter:
             attrs = {
                 **base_attrs,
                 "last_update_success": True,
-                "last_update_message": "Current month statistics synchronized",
+                "last_update_message": (
+                    f"Current month statistics synchronized; truncated from {truncated_from_day.isoformat()}"
+                    if truncated_from_day is not None
+                    else "Current month statistics synchronized"
+                ),
                 "current_month_hourly_rows": len(sorted_meas),
                 "current_month_api_hourly_rows": len(api_measurement_starts),
                 "current_month_new_statistics_rows": len(statistics),
@@ -1541,6 +1686,7 @@ class OctopusConsumptionStatisticsImporter:
                 "current_month_zero_filled_hours": zero_filled_hours,
                 "current_month_imported_total_kwh": round(imported_month_total, 6),
                 "api_data_through": api_data_through.isoformat() if api_data_through else None,
+                "truncated_from_day": truncated_from_day.isoformat() if truncated_from_day else None,
                 "hours_not_yet_available": hours_not_yet_available,
                 "last_imported_hour": last_imported_hour.isoformat() if last_imported_hour else None,
                 "last_imported_sum_kwh": round(running_sum, 6),
