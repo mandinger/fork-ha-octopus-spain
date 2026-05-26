@@ -565,12 +565,15 @@ class OctopusConsumptionStatisticsSensor(
         self._attr_entity_id = f"sensor.consumo_electrico_{safe_account}"
         self._attr_unique_id = f"energy_consumption_{safe_account}"
         self._statistic_id = self._attr_entity_id
+        # This entity mirrors a delayed, recorder-backed cumulative total.
+        # Do not opt into automatic recorder statistics here, or Home Assistant
+        # will synthesize additional "live" statistics from the mirrored state
+        # and pollute the imported history with current-day rows.
         self.entity_description = SensorEntityDescription(
             key=f"energy_consumption_{safe_account}",
             icon="mdi:transmission-tower-import",
             device_class=SensorDeviceClass.ENERGY,
             native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-            state_class=SensorStateClass.TOTAL_INCREASING,
         )
 
     async def async_added_to_hass(self) -> None:
