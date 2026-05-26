@@ -15,6 +15,7 @@ from homeassistant.const import (
     UnitOfEnergy,
 )
 from homeassistant.core import HomeAssistant, callback, valid_entity_id
+from homeassistant.helpers.event import async_track_point_in_utc_time
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -238,6 +239,50 @@ class _InvoiceRefreshMixin(CoordinatorEntity[OctopusCoordinator]):
 
     _account: str
     _pdf_refresh_requested: bool
+    _pdf_expiry_listener: Callable[[], None] | None
+
+    def _cancel_pdf_expiry_listener(self) -> None:
+        if self._pdf_expiry_listener is None:
+            return
+        self._pdf_expiry_listener()
+        self._pdf_expiry_listener = None
+
+    def _schedule_pdf_expiry_checkpoint(
+        self, invoice: Mapping[str, Any], prefix: str
+    ) -> None:
+        pdf_url = invoice.get("pdf")
+        expires_at = _parse_invoice_pdf_expiry(invoice)
+        if not pdf_url or expires_at is None:
+            self._cancel_pdf_expiry_listener()
+            return
+
+        now = dt_util.utcnow()
+        refresh_at = expires_at - PDF_URL_REFRESH_BUFFER
+        checkpoint_at: datetime | None = None
+        if now < refresh_at:
+            checkpoint_at = refresh_at
+        elif now < expires_at:
+            checkpoint_at = expires_at
+
+        self._cancel_pdf_expiry_listener()
+        if checkpoint_at is None:
+            return
+
+        @callback
+        def _async_pdf_expiry_checkpoint(_: datetime) -> None:
+            self._pdf_expiry_listener = None
+            _LOGGER.debug(
+                "%s: PDF URL checkpoint reached at %s",
+                prefix,
+                checkpoint_at.isoformat(),
+            )
+            self._handle_coordinator_update()
+
+        self._pdf_expiry_listener = async_track_point_in_utc_time(
+            self.hass,
+            _async_pdf_expiry_checkpoint,
+            checkpoint_at,
+        )
 
     def _maybe_refresh_invoice_pdf(self, invoice: Mapping[str, Any], prefix: str) -> None:
         pdf_url = invoice.get("pdf")
@@ -268,6 +313,10 @@ class _InvoiceRefreshMixin(CoordinatorEntity[OctopusCoordinator]):
         """Allow manual entity refresh to fetch a fresh signed PDF URL."""
         await self.coordinator.async_refresh_account_invoice(self._account)
 
+    async def async_will_remove_from_hass(self) -> None:
+        self._cancel_pdf_expiry_listener()
+        await super().async_will_remove_from_hass()
+
 
 class OctopusInvoice(_InvoiceRefreshMixin, SensorEntity):
 
@@ -276,6 +325,7 @@ class OctopusInvoice(_InvoiceRefreshMixin, SensorEntity):
         self._state = None
         self._account = account
         self._pdf_refresh_requested = False
+        self._pdf_expiry_listener = None
         safe_account = _account_slug(account)
         self._attrs: Mapping[str, Any] = {}
         self._attr_name = _account_name("Última Factura Octopus", account)
@@ -302,6 +352,7 @@ class OctopusInvoice(_InvoiceRefreshMixin, SensorEntity):
                 _LOGGER.debug("%s: no account data available yet", prefix)
                 self._state = None
                 self._attrs = {}
+                self._cancel_pdf_expiry_listener()
                 self.async_write_ha_state()
                 return
 
@@ -310,9 +361,11 @@ class OctopusInvoice(_InvoiceRefreshMixin, SensorEntity):
                 _LOGGER.debug("%s: 'last_invoice' not present in coordinator data", prefix)
                 self._state = None
                 self._attrs = {}
+                self._cancel_pdf_expiry_listener()
                 self.async_write_ha_state()
                 return
 
+            self._schedule_pdf_expiry_checkpoint(inv, prefix)
             self._maybe_refresh_invoice_pdf(inv, prefix)
             pdf_expires_at, pdf_is_expired = _invoice_pdf_status(inv)
 
@@ -391,6 +444,7 @@ class OctopusInvoiceFieldSensor(_InvoiceRefreshMixin, SensorEntity):
         self._state: StateType = None
         self._account = account
         self._pdf_refresh_requested = False
+        self._pdf_expiry_listener = None
         self._field = field
         safe_account = _account_slug(account)
         safe_field = slugify(field)
@@ -426,11 +480,13 @@ class OctopusInvoiceFieldSensor(_InvoiceRefreshMixin, SensorEntity):
                 _LOGGER.debug("%s: no account data available yet", prefix)
                 self._state = None
                 self._attrs = {}
+                self._cancel_pdf_expiry_listener()
                 self.async_write_ha_state()
                 return
 
             inv = account_data.get("last_invoice") or {}
             if self._field == "pdf":
+                self._schedule_pdf_expiry_checkpoint(inv, prefix)
                 self._maybe_refresh_invoice_pdf(inv, prefix)
             raw = inv.get(self._field)
             # Handle date device class: needs date/datetime, not string
@@ -509,12 +565,16 @@ class OctopusConsumptionStatisticsSensor(
         self._attr_entity_id = f"sensor.consumo_electrico_{safe_account}"
         self._attr_unique_id = f"energy_consumption_{safe_account}"
         self._statistic_id = self._attr_entity_id
+        # This entity mirrors a recorder-backed cumulative total. Use TOTAL so
+        # the entity remains eligible for Energy Dashboard selection, without
+        # TOTAL_INCREASING reset semantics if the mirrored value ever moves
+        # backwards during reconciliation or Home Assistant restarts.
         self.entity_description = SensorEntityDescription(
             key=f"energy_consumption_{safe_account}",
             icon="mdi:transmission-tower-import",
             device_class=SensorDeviceClass.ENERGY,
             native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-            state_class=SensorStateClass.TOTAL_INCREASING,
+            state_class=SensorStateClass.TOTAL,
         )
 
     async def async_added_to_hass(self) -> None:
@@ -1112,17 +1172,22 @@ class OctopusConsumptionStatisticsImporter:
 
     @staticmethod
     def _month_import_window(now_utc: datetime) -> tuple[datetime, datetime]:
-        """Return the delayed Home Assistant-local current month window in UTC."""
+        """Return the Home Assistant-local current month import window in UTC."""
         now_local = dt_util.as_local(now_utc)
         month_start_local = now_local.replace(
             day=1, hour=0, minute=0, second=0, microsecond=0
         )
-        delayed_end_local = (now_local - timedelta(days=CONSUMPTION_IMPORT_DELAY_DAYS)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        if delayed_end_local < month_start_local:
-            delayed_end_local = month_start_local
-        return dt_util.as_utc(month_start_local), dt_util.as_utc(delayed_end_local)
+        if CONSUMPTION_IMPORT_DELAY_DAYS <= 0:
+            import_end_local = (now_local + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+        else:
+            import_end_local = (now_local - timedelta(days=CONSUMPTION_IMPORT_DELAY_DAYS)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+        if import_end_local < month_start_local:
+            import_end_local = month_start_local
+        return dt_util.as_utc(month_start_local), dt_util.as_utc(import_end_local)
 
     def _local_day_hour_starts(self, day: date) -> list[datetime]:
         """Return expected hourly interval starts for a local day in UTC."""
@@ -1142,12 +1207,32 @@ class OctopusConsumptionStatisticsImporter:
             return measurements_by_start, None
 
         days = sorted({self._local_date(start_utc) for start_utc in measurements_by_start})
+        today_local = dt_util.as_local(dt_util.utcnow()).date()
         for day in days:
             expected_starts = self._local_day_hour_starts(day)
             missing_starts = [
                 start_utc for start_utc in expected_starts if start_utc not in measurements_by_start
             ]
             if not missing_starts:
+                continue
+
+            day_starts = [
+                start_utc
+                for start_utc in measurements_by_start
+                if self._local_date(start_utc) == day
+            ]
+            latest_day_start = max(day_starts, default=None)
+            if (
+                day == today_local
+                and latest_day_start is not None
+                and all(start_utc > latest_day_start for start_utc in missing_starts)
+            ):
+                _LOGGER.debug(
+                    "%s: keeping partial current-day data for %s through %s",
+                    prefix,
+                    day.isoformat(),
+                    latest_day_start.isoformat(),
+                )
                 continue
 
             day_start = self._local_day_start_utc(day)

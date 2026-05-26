@@ -7,5 +7,5 @@ CONF_PASSWORD = "password"
 CONF_APIKEY = "apikey"
 CONF_AUTH_TYPE: Final = "auth_type"
 UPDATE_INTERVAL = 2
-CONSUMPTION_IMPORT_DELAY_DAYS = 5
+CONSUMPTION_IMPORT_DELAY_DAYS = 0
 AUTH_OPTIONS: Final = ["username/password", "apikey"]
