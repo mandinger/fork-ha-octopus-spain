@@ -15,6 +15,7 @@ from homeassistant.const import (
     UnitOfEnergy,
 )
 from homeassistant.core import HomeAssistant, callback, valid_entity_id
+from homeassistant.helpers.event import async_track_point_in_utc_time
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -238,6 +239,50 @@ class _InvoiceRefreshMixin(CoordinatorEntity[OctopusCoordinator]):
 
     _account: str
     _pdf_refresh_requested: bool
+    _pdf_expiry_listener: Callable[[], None] | None
+
+    def _cancel_pdf_expiry_listener(self) -> None:
+        if self._pdf_expiry_listener is None:
+            return
+        self._pdf_expiry_listener()
+        self._pdf_expiry_listener = None
+
+    def _schedule_pdf_expiry_checkpoint(
+        self, invoice: Mapping[str, Any], prefix: str
+    ) -> None:
+        pdf_url = invoice.get("pdf")
+        expires_at = _parse_invoice_pdf_expiry(invoice)
+        if not pdf_url or expires_at is None:
+            self._cancel_pdf_expiry_listener()
+            return
+
+        now = dt_util.utcnow()
+        refresh_at = expires_at - PDF_URL_REFRESH_BUFFER
+        checkpoint_at: datetime | None = None
+        if now < refresh_at:
+            checkpoint_at = refresh_at
+        elif now < expires_at:
+            checkpoint_at = expires_at
+
+        self._cancel_pdf_expiry_listener()
+        if checkpoint_at is None:
+            return
+
+        @callback
+        def _async_pdf_expiry_checkpoint(_: datetime) -> None:
+            self._pdf_expiry_listener = None
+            _LOGGER.debug(
+                "%s: PDF URL checkpoint reached at %s",
+                prefix,
+                checkpoint_at.isoformat(),
+            )
+            self._handle_coordinator_update()
+
+        self._pdf_expiry_listener = async_track_point_in_utc_time(
+            self.hass,
+            _async_pdf_expiry_checkpoint,
+            checkpoint_at,
+        )
 
     def _maybe_refresh_invoice_pdf(self, invoice: Mapping[str, Any], prefix: str) -> None:
         pdf_url = invoice.get("pdf")
@@ -268,6 +313,10 @@ class _InvoiceRefreshMixin(CoordinatorEntity[OctopusCoordinator]):
         """Allow manual entity refresh to fetch a fresh signed PDF URL."""
         await self.coordinator.async_refresh_account_invoice(self._account)
 
+    async def async_will_remove_from_hass(self) -> None:
+        self._cancel_pdf_expiry_listener()
+        await super().async_will_remove_from_hass()
+
 
 class OctopusInvoice(_InvoiceRefreshMixin, SensorEntity):
 
@@ -276,6 +325,7 @@ class OctopusInvoice(_InvoiceRefreshMixin, SensorEntity):
         self._state = None
         self._account = account
         self._pdf_refresh_requested = False
+        self._pdf_expiry_listener = None
         safe_account = _account_slug(account)
         self._attrs: Mapping[str, Any] = {}
         self._attr_name = _account_name("Última Factura Octopus", account)
@@ -302,6 +352,7 @@ class OctopusInvoice(_InvoiceRefreshMixin, SensorEntity):
                 _LOGGER.debug("%s: no account data available yet", prefix)
                 self._state = None
                 self._attrs = {}
+                self._cancel_pdf_expiry_listener()
                 self.async_write_ha_state()
                 return
 
@@ -310,9 +361,11 @@ class OctopusInvoice(_InvoiceRefreshMixin, SensorEntity):
                 _LOGGER.debug("%s: 'last_invoice' not present in coordinator data", prefix)
                 self._state = None
                 self._attrs = {}
+                self._cancel_pdf_expiry_listener()
                 self.async_write_ha_state()
                 return
 
+            self._schedule_pdf_expiry_checkpoint(inv, prefix)
             self._maybe_refresh_invoice_pdf(inv, prefix)
             pdf_expires_at, pdf_is_expired = _invoice_pdf_status(inv)
 
@@ -391,6 +444,7 @@ class OctopusInvoiceFieldSensor(_InvoiceRefreshMixin, SensorEntity):
         self._state: StateType = None
         self._account = account
         self._pdf_refresh_requested = False
+        self._pdf_expiry_listener = None
         self._field = field
         safe_account = _account_slug(account)
         safe_field = slugify(field)
@@ -426,11 +480,13 @@ class OctopusInvoiceFieldSensor(_InvoiceRefreshMixin, SensorEntity):
                 _LOGGER.debug("%s: no account data available yet", prefix)
                 self._state = None
                 self._attrs = {}
+                self._cancel_pdf_expiry_listener()
                 self.async_write_ha_state()
                 return
 
             inv = account_data.get("last_invoice") or {}
             if self._field == "pdf":
+                self._schedule_pdf_expiry_checkpoint(inv, prefix)
                 self._maybe_refresh_invoice_pdf(inv, prefix)
             raw = inv.get(self._field)
             # Handle date device class: needs date/datetime, not string
