@@ -565,16 +565,15 @@ class OctopusConsumptionStatisticsSensor(
         self._attr_entity_id = f"sensor.consumo_electrico_{safe_account}"
         self._attr_unique_id = f"energy_consumption_{safe_account}"
         self._statistic_id = self._attr_entity_id
-        # This entity mirrors a recorder-backed cumulative total. Use TOTAL so
-        # the entity remains eligible for Energy Dashboard selection, without
-        # TOTAL_INCREASING reset semantics if the mirrored value ever moves
-        # backwards during reconciliation or Home Assistant restarts.
+        # This entity mirrors recorder-backed imported statistics. Avoid
+        # advertising a local state_class here so Recorder does not generate a
+        # second native statistics stream that can collide with the imported
+        # cumulative sums for the same entity_id/statistic_id.
         self.entity_description = SensorEntityDescription(
             key=f"energy_consumption_{safe_account}",
             icon="mdi:transmission-tower-import",
             device_class=SensorDeviceClass.ENERGY,
             native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-            state_class=SensorStateClass.TOTAL,
         )
 
     async def async_added_to_hass(self) -> None:
@@ -983,6 +982,13 @@ class OctopusConsumptionStatisticsImporter:
                     max_abs_delta = point_abs_delta
                 if first_mismatch_start is None:
                     first_mismatch_start = slot_start
+                day_statistics.append(
+                    {
+                        "start": slot_start,
+                        "state": running,
+                        "sum": running,
+                    }
+                )
 
         if mismatch_count:
             # Avoid repeating exactly the same warning fingerprint on every refresh.
@@ -991,7 +997,7 @@ class OctopusConsumptionStatisticsImporter:
             if last_fingerprint != fingerprint:
                 self._reconcile_warning_fingerprint_by_day[day] = fingerprint
                 _LOGGER.warning(
-                    "%s: reconcile day %s found %s existing statistic mismatch(es), first=%s, max_delta=%.3f kWh. Existing points are not overwritten.",
+                    "%s: reconcile day %s found %s existing statistic mismatch(es), first=%s, max_delta=%.3f kWh. Re-importing corrected cumulative sums.",
                     prefix,
                     day.isoformat(),
                     mismatch_count,
@@ -1689,11 +1695,12 @@ class OctopusConsumptionStatisticsImporter:
                 if existing_sum is not None:
                     reused_existing_points += 1
                     point_delta = abs(existing_sum - running_sum)
-                    if point_delta > sum_tolerance_kwh:
-                        mismatched_existing_points += 1
-                        if point_delta > max_existing_delta:
-                            max_existing_delta = point_delta
-                    continue
+                    if point_delta <= sum_tolerance_kwh:
+                        continue
+
+                    mismatched_existing_points += 1
+                    if point_delta > max_existing_delta:
+                        max_existing_delta = point_delta
 
                 statistics.append({
                     "start": start_utc,
@@ -1723,7 +1730,7 @@ class OctopusConsumptionStatisticsImporter:
                 if self._current_month_mismatch_fingerprint != fingerprint:
                     self._current_month_mismatch_fingerprint = fingerprint
                     _LOGGER.warning(
-                        "%s: reconstructed current-month totals differ from %s existing recorder point(s) (max_delta=%.3f kWh). Existing points are left untouched to avoid duplicate accumulation.",
+                        "%s: reconstructed current-month totals differ from %s existing recorder point(s) (max_delta=%.3f kWh). Re-importing corrected cumulative sums for those hours.",
                         prefix,
                         mismatched_existing_points,
                         max_existing_delta,
