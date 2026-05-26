@@ -1171,17 +1171,22 @@ class OctopusConsumptionStatisticsImporter:
 
     @staticmethod
     def _month_import_window(now_utc: datetime) -> tuple[datetime, datetime]:
-        """Return the delayed Home Assistant-local current month window in UTC."""
+        """Return the Home Assistant-local current month import window in UTC."""
         now_local = dt_util.as_local(now_utc)
         month_start_local = now_local.replace(
             day=1, hour=0, minute=0, second=0, microsecond=0
         )
-        delayed_end_local = (now_local - timedelta(days=CONSUMPTION_IMPORT_DELAY_DAYS)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        if delayed_end_local < month_start_local:
-            delayed_end_local = month_start_local
-        return dt_util.as_utc(month_start_local), dt_util.as_utc(delayed_end_local)
+        if CONSUMPTION_IMPORT_DELAY_DAYS <= 0:
+            import_end_local = (now_local + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+        else:
+            import_end_local = (now_local - timedelta(days=CONSUMPTION_IMPORT_DELAY_DAYS)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+        if import_end_local < month_start_local:
+            import_end_local = month_start_local
+        return dt_util.as_utc(month_start_local), dt_util.as_utc(import_end_local)
 
     def _local_day_hour_starts(self, day: date) -> list[datetime]:
         """Return expected hourly interval starts for a local day in UTC."""
@@ -1201,12 +1206,32 @@ class OctopusConsumptionStatisticsImporter:
             return measurements_by_start, None
 
         days = sorted({self._local_date(start_utc) for start_utc in measurements_by_start})
+        today_local = dt_util.as_local(dt_util.utcnow()).date()
         for day in days:
             expected_starts = self._local_day_hour_starts(day)
             missing_starts = [
                 start_utc for start_utc in expected_starts if start_utc not in measurements_by_start
             ]
             if not missing_starts:
+                continue
+
+            day_starts = [
+                start_utc
+                for start_utc in measurements_by_start
+                if self._local_date(start_utc) == day
+            ]
+            latest_day_start = max(day_starts, default=None)
+            if (
+                day == today_local
+                and latest_day_start is not None
+                and all(start_utc > latest_day_start for start_utc in missing_starts)
+            ):
+                _LOGGER.debug(
+                    "%s: keeping partial current-day data for %s through %s",
+                    prefix,
+                    day.isoformat(),
+                    latest_day_start.isoformat(),
+                )
                 continue
 
             day_start = self._local_day_start_utc(day)
