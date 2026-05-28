@@ -582,6 +582,7 @@ class OctopusConsumptionStatisticsSensor(
         self._attr_name = _account_name("Consumo Electrico", account)
         self._attr_entity_id = _consumption_entity_id(account)
         self._attr_unique_id = f"energy_consumption_v2_{safe_account}"
+        self._statistic_id = _consumption_statistic_id(account)
         self.entity_description = SensorEntityDescription(
             key=f"energy_consumption_v2_{safe_account}",
             icon="mdi:transmission-tower-import",
