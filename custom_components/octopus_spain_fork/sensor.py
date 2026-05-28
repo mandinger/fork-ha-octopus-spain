@@ -64,7 +64,12 @@ def _account_name(name: str, account: str) -> str:
 
 
 def _consumption_entity_id(account: str) -> str:
-    """Return the account-scoped entity_id for the consumption sensor."""
+    """Return the live sensor entity_id for the imported consumption total."""
+    return f"sensor.octopus_energy_consumption_{_account_slug(account)}"
+
+
+def _consumption_statistic_id(account: str) -> str:
+    """Return the recorder statistic_id used by dashboards and statistics."""
     return f"sensor.energy_consumption_{_account_slug(account)}"
 
 
@@ -576,10 +581,7 @@ class OctopusConsumptionStatisticsSensor(
         safe_account = _account_slug(account)
         self._attr_name = _account_name("Consumo Electrico", account)
         self._attr_entity_id = _consumption_entity_id(account)
-        # Version the unique_id so Home Assistant creates a fresh registry entry
-        # with the account-scoped entity_id instead of keeping a legacy one.
         self._attr_unique_id = f"energy_consumption_v2_{safe_account}"
-        self._statistic_id = self._attr_entity_id
         self.entity_description = SensorEntityDescription(
             key=f"energy_consumption_v2_{safe_account}",
             icon="mdi:transmission-tower-import",
@@ -591,7 +593,6 @@ class OctopusConsumptionStatisticsSensor(
     async def async_added_to_hass(self) -> None:
         """Start importing statistics once Home Assistant has assigned entity_id."""
         await super().async_added_to_hass()
-        self._statistic_id = self.entity_id
         self._importer = OctopusConsumptionStatisticsImporter(
             hass=self.hass,
             coordinator=self.coordinator,
@@ -611,13 +612,20 @@ class OctopusConsumptionStatisticsSensor(
     ) -> None:
         """Update the sensor from the imported recorder statistic total."""
         previous_value = self._state
-        self._state = value
+        next_value = value
+        if (
+            previous_value is not None
+            and value is not None
+            and value < previous_value
+        ):
+            next_value = previous_value
+        self._state = next_value
         if attrs is not None:
             self._attrs = attrs
         # Avoid periodic writes with the same cumulative value. Those writes let
         # recorder synthesize fresh statistics rows from the entity state, which
         # can conflict with the imported cumulative sums when the API is delayed.
-        if getattr(self, "_hass", None) is not None and previous_value != value:
+        if getattr(self, "_hass", None) is not None and previous_value != next_value:
             self.async_write_ha_state()
 
     @property
