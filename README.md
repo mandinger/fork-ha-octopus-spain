@@ -85,12 +85,12 @@ Para ver una tarjeta de ejemplo con estos sensores, consulta el panel de muestra
 El componente no ofrece consumo en tiempo real. En su lugar, importa de forma retroactiva los datos horarios de consumo facilitados por Octopus y los inserta en el sistema de estadísticas de Home Assistant.
 
 - Fuente: datos horarios (hourly) de consumo por cuenta.
-- Funcionamiento: en cada actualización se vuelve a consultar el mes natural en curso, usando la zona horaria de Home Assistant, y se reimportan las estadísticas horarias acumuladas usando el mismo `entity_id` que tenga la entidad en Home Assistant. Esto permite corregir horas que Octopus publica con retraso o que aparecen días después.
-- Si Octopus todavía no ha publicado datos horarios del mes, se crea una estadística base con el total acumulado anterior para que el Panel de Energía pueda reconocer la entidad.
+- Funcionamiento: en cada actualización se vuelve a consultar el mes natural en curso, usando la zona horaria de Home Assistant, y se reimportan las estadísticas horarias acumuladas en un único `statistic_id` externo estable. Esto permite corregir horas que Octopus publica con retraso o que aparecen días después.
+- Si Octopus todavía no ha publicado datos horarios del mes, se crea una estadística base con el total acumulado anterior para que el Panel de Energía pueda reconocer la estadística.
 - Diagnóstico: la entidad incluye atributos como `current_month_imported_total_kwh`, `api_data_through`, `hours_not_yet_available`, `current_month_api_hourly_rows`, `current_month_hourly_rows` y `current_month_zero_filled_hours` para comprobar hasta qué hora ha devuelto datos la API.
 - Tipo de dato: estadística externa con suma acumulada por hora.
 - Unidad: kWh.
-- Identificador de estadística (`statistic_id`): el `entity_id` real de la entidad, por ejemplo `sensor.consumo_electrico` o `sensor.consumo_electrico_<cuenta_slug>`.
+- Identificador de estadística (`statistic_id`): `octopus_spain_fork:energy_consumption_<cuenta_slug>`.
 - Nombre mostrado en HA: "Consumo Electrico" o "Consumo Electrico (<cuenta>)" cuando hay varias cuentas.
 
 Uso en interfaz:
