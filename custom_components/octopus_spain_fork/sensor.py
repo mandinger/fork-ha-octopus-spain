@@ -20,6 +20,7 @@ except ImportError:  # pragma: no cover - older Home Assistant versions
     MATCH_ALL = None
 from homeassistant.core import HomeAssistant, callback, valid_entity_id
 from homeassistant.helpers.event import async_track_point_in_utc_time
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -63,9 +64,52 @@ def _account_name(name: str, account: str) -> str:
     return f"{name} ({account})"
 
 
-def _consumption_entity_id(account: str) -> str:
-    """Return the account-scoped entity_id for the consumption sensor."""
-    return f"sensor.energy_consumption_{_account_slug(account)}"
+def _consumption_statistic_id(account: str) -> str:
+    """Return the external recorder statistic_id used for imported history."""
+    return f"{DOMAIN}:energy_consumption_{_account_slug(account)}"
+
+
+def _consumption_unique_id(account: str) -> str:
+    """Return the stable entity registry unique_id for the consumption sensor."""
+    return f"energy_consumption_{_account_slug(account)}"
+
+
+def _legacy_consumption_unique_id(account: str) -> str:
+    """Return the retired v2 unique_id that created a duplicate consumption entity."""
+    return f"energy_consumption_v2_{_account_slug(account)}"
+
+
+def _remove_legacy_consumption_entities(
+    hass: HomeAssistant,
+    entry: OctopusSpainConfigEntry,
+    accounts: list[str],
+) -> None:
+    """Remove duplicate v2 consumption entities from the entity registry."""
+    registry = er.async_get(hass)
+    legacy_unique_ids = {
+        _legacy_consumption_unique_id(account) for account in accounts
+    }
+    entries_for_config_entry = getattr(er, "async_entries_for_config_entry", None)
+    if entries_for_config_entry is not None:
+        entries = entries_for_config_entry(registry, entry.entry_id)
+    else:  # pragma: no cover - compatibility with older Home Assistant versions
+        entries = [
+            entity_entry
+            for entity_entry in registry.entities.values()
+            if entity_entry.config_entry_id == entry.entry_id
+        ]
+
+    for entity_entry in entries:
+        if (
+            entity_entry.domain == "sensor"
+            and entity_entry.unique_id in legacy_unique_ids
+        ):
+            registry.async_remove(entity_entry.entity_id)
+            _LOGGER.info(
+                "Removed duplicate legacy consumption entity %s (%s)",
+                entity_entry.entity_id,
+                entity_entry.unique_id,
+            )
 
 
 def _parse_invoice_pdf_expiry(invoice: Mapping[str, Any]) -> datetime | None:
@@ -98,6 +142,7 @@ async def async_setup_entry(
 
     sensors = []
     accounts = list(coordinator.data)
+    _remove_legacy_consumption_entities(hass, entry, accounts)
     single_account = len(accounts) == 1
     for account in accounts:
         # Wallets
@@ -573,25 +618,19 @@ class OctopusConsumptionStatisticsSensor(
         self._single = single
         self._attrs: Mapping[str, Any] = {}
         self._importer: OctopusConsumptionStatisticsImporter | None = None
-        safe_account = _account_slug(account)
         self._attr_name = _account_name("Consumo Electrico", account)
-        self._attr_entity_id = _consumption_entity_id(account)
-        # Version the unique_id so Home Assistant creates a fresh registry entry
-        # with the account-scoped entity_id instead of keeping a legacy one.
-        self._attr_unique_id = f"energy_consumption_v2_{safe_account}"
-        self._statistic_id = self._attr_entity_id
+        self._attr_unique_id = _consumption_unique_id(account)
+        self._statistic_id = _consumption_statistic_id(account)
         self.entity_description = SensorEntityDescription(
-            key=f"energy_consumption_v2_{safe_account}",
+            key=self._attr_unique_id,
             icon="mdi:transmission-tower-import",
             device_class=SensorDeviceClass.ENERGY,
             native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-            state_class=SensorStateClass.TOTAL_INCREASING,
         )
 
     async def async_added_to_hass(self) -> None:
         """Start importing statistics once Home Assistant has assigned entity_id."""
         await super().async_added_to_hass()
-        self._statistic_id = self.entity_id
         self._importer = OctopusConsumptionStatisticsImporter(
             hass=self.hass,
             coordinator=self.coordinator,
@@ -611,13 +650,20 @@ class OctopusConsumptionStatisticsSensor(
     ) -> None:
         """Update the sensor from the imported recorder statistic total."""
         previous_value = self._state
-        self._state = value
+        next_value = value
+        if (
+            previous_value is not None
+            and value is not None
+            and value < previous_value
+        ):
+            next_value = previous_value
+        self._state = next_value
         if attrs is not None:
             self._attrs = attrs
         # Avoid periodic writes with the same cumulative value. Those writes let
         # recorder synthesize fresh statistics rows from the entity state, which
         # can conflict with the imported cumulative sums when the API is delayed.
-        if getattr(self, "_hass", None) is not None and previous_value != value:
+        if getattr(self, "_hass", None) is not None and previous_value != next_value:
             self.async_write_ha_state()
 
     @property
