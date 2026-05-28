@@ -312,8 +312,10 @@ class OctopusSpain:
             return "Etc/GMT"
         return timezone_name.replace('"', "")
 
-    async def account(self, account: str):
+    async def account(self, account: str, *, force_login: bool = False):
         # Ensure we're authenticated (mirror logic from hourly_consumption)
+        if force_login:
+            self._token = None
         if self._token is None:
             if not await self.login():
                 _LOGGER.error(

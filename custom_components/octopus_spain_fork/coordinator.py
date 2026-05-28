@@ -12,6 +12,29 @@ from .const import CONSUMPTION_IMPORT_DELAY_DAYS, UPDATE_INTERVAL
 from .lib.octopus_spain_fork import OctopusSpain
 
 _LOGGER = logging.getLogger(__name__)
+PDF_REFRESH_BUFFER = timedelta(minutes=5)
+
+
+def _parse_invoice_expiry(value: Any) -> datetime | None:
+    """Parse a stored invoice PDF expiry into UTC."""
+    if not value:
+        return None
+    parsed = dt_util.parse_datetime(str(value))
+    if parsed is None:
+        return None
+    return dt_util.as_utc(parsed)
+
+
+def _invoice_pdf_needs_refresh(invoice: dict[str, Any] | None) -> bool:
+    """Return whether the invoice PDF URL is missing or close to expiry."""
+    if not invoice:
+        return True
+    if not invoice.get("pdf"):
+        return True
+    expires_at = _parse_invoice_expiry(invoice.get("pdf_expires_at"))
+    if expires_at is None:
+        return True
+    return expires_at <= dt_util.utcnow() + PDF_REFRESH_BUFFER
 
 
 class OctopusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -78,11 +101,32 @@ class OctopusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self._invoice_refreshing_accounts.add(account)
         try:
+            current = self._data.get(account, {})
+            current_invoice = current.get("last_invoice", {}) if isinstance(current, dict) else {}
+            current_pdf = current_invoice.get("pdf")
+
             refreshed = await self._api.account(account)
             if not refreshed:
                 return False
 
-            current = self._data.get(account, {})
+            refreshed_invoice = (
+                refreshed.get("last_invoice", {}) if isinstance(refreshed, dict) else {}
+            )
+            refreshed_pdf = refreshed_invoice.get("pdf")
+            refreshed_needs_retry = _invoice_pdf_needs_refresh(refreshed_invoice)
+            current_needs_refresh = _invoice_pdf_needs_refresh(current_invoice)
+
+            if refreshed_needs_retry and (
+                refreshed_pdf == current_pdf or current_needs_refresh
+            ):
+                _LOGGER.debug(
+                    "Invoice refresh for %s returned a stale or expiring PDF URL; retrying with fresh login",
+                    account,
+                )
+                relogged = await self._api.account(account, force_login=True)
+                if relogged:
+                    refreshed = relogged
+
             merged = {**current, **refreshed}
             if "hourly_consumption" in current and "hourly_consumption" not in merged:
                 merged["hourly_consumption"] = current["hourly_consumption"]
