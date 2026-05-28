@@ -14,6 +14,10 @@ from homeassistant.const import (
     CURRENCY_EURO,
     UnitOfEnergy,
 )
+try:
+    from homeassistant.const import MATCH_ALL
+except ImportError:  # pragma: no cover - older Home Assistant versions
+    MATCH_ALL = None
 from homeassistant.core import HomeAssistant, callback, valid_entity_id
 from homeassistant.helpers.event import async_track_point_in_utc_time
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -57,6 +61,11 @@ def _account_slug(account: str) -> str:
 def _account_name(name: str, account: str) -> str:
     """Return a display name scoped to an Octopus account."""
     return f"{name} ({account})"
+
+
+def _consumption_entity_id(account: str) -> str:
+    """Return the account-scoped entity_id for the consumption sensor."""
+    return f"sensor.energy_consumption_{_account_slug(account)}"
 
 
 def _parse_invoice_pdf_expiry(invoice: Mapping[str, Any]) -> datetime | None:
@@ -548,6 +557,10 @@ class OctopusConsumptionStatisticsSensor(
 ):
     """Expose the imported cumulative consumption statistic as an energy sensor."""
 
+    _unrecorded_attributes = (
+        frozenset({MATCH_ALL}) if MATCH_ALL is not None else frozenset()
+    )
+
     def __init__(
         self,
         account: str,
@@ -562,19 +575,17 @@ class OctopusConsumptionStatisticsSensor(
         self._importer: OctopusConsumptionStatisticsImporter | None = None
         safe_account = _account_slug(account)
         self._attr_name = _account_name("Consumo Electrico", account)
-        self._attr_entity_id = f"sensor.consumo_electrico_{safe_account}"
-        self._attr_unique_id = f"energy_consumption_{safe_account}"
+        self._attr_entity_id = _consumption_entity_id(account)
+        # Version the unique_id so Home Assistant creates a fresh registry entry
+        # with the account-scoped entity_id instead of keeping a legacy one.
+        self._attr_unique_id = f"energy_consumption_v2_{safe_account}"
         self._statistic_id = self._attr_entity_id
-        # This entity mirrors recorder-backed imported statistics. Avoid
-        # advertising a local state_class here so Recorder does not generate a
-        # second native statistics stream that can collide with the imported
-        # cumulative sums for the same entity_id/statistic_id.
         self.entity_description = SensorEntityDescription(
-            key=f"energy_consumption_{safe_account}",
+            key=f"energy_consumption_v2_{safe_account}",
             icon="mdi:transmission-tower-import",
             device_class=SensorDeviceClass.ENERGY,
             native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-            state_class=SensorStateClass.TOTAL,
+            state_class=SensorStateClass.TOTAL_INCREASING,
         )
 
     async def async_added_to_hass(self) -> None:
@@ -599,10 +610,14 @@ class OctopusConsumptionStatisticsSensor(
         attrs: Mapping[str, Any] | None = None,
     ) -> None:
         """Update the sensor from the imported recorder statistic total."""
+        previous_value = self._state
         self._state = value
         if attrs is not None:
             self._attrs = attrs
-        if getattr(self, "_hass", None) is not None:
+        # Avoid periodic writes with the same cumulative value. Those writes let
+        # recorder synthesize fresh statistics rows from the entity state, which
+        # can conflict with the imported cumulative sums when the API is delayed.
+        if getattr(self, "_hass", None) is not None and previous_value != value:
             self.async_write_ha_state()
 
     @property
@@ -1496,6 +1511,7 @@ class OctopusConsumptionStatisticsImporter:
                         import_start_utc=import_start_utc,
                         baseline_sum=baseline_sum,
                     )
+                retained_sum = last_sum if last_start is not None else baseline_sum
                 attrs = {
                     **base_attrs,
                     "last_update_success": True,
@@ -1512,7 +1528,7 @@ class OctopusConsumptionStatisticsImporter:
                         int((import_end_utc - import_start_utc).total_seconds() // 3600),
                     ),
                 }
-                self._state_callback(baseline_sum, attrs)
+                self._state_callback(retained_sum, attrs)
                 _LOGGER.debug(
                     "%s: current-month hourly pull returned 0 rows for %s..%s",
                     prefix,
@@ -1632,6 +1648,7 @@ class OctopusConsumptionStatisticsImporter:
                         import_start_utc=import_start_utc,
                         baseline_sum=baseline_sum,
                     )
+                retained_sum = last_sum if last_start is not None else baseline_sum
                 attrs = {
                     **base_attrs,
                     "last_update_success": True,
@@ -1654,7 +1671,7 @@ class OctopusConsumptionStatisticsImporter:
                         int((import_end_utc - import_start_utc).total_seconds() // 3600),
                     ),
                 }
-                self._state_callback(baseline_sum, attrs)
+                self._state_callback(retained_sum, attrs)
                 _LOGGER.debug(
                     "%s: no hourly consumption data available after consolidation",
                     prefix,
