@@ -268,6 +268,9 @@ async def async_setup_entry(
         sensors.extend(
             _contract_sensors(account, coordinator, account_data.get("contract"))
         )
+
+        # Billing cycle and payment forecast
+        sensors.extend(_billing_sensors(account, coordinator))
     async_add_entities(sensors)
 
 
@@ -847,6 +850,42 @@ def _contract_sensors(
             )
         )
     return sensors
+
+
+def _billing_sensors(
+    account: str, coordinator: OctopusCoordinator
+) -> list[OctopusAccountFieldSensor]:
+    """Build the billing-cycle and payment-forecast sensors for one account."""
+    return [
+        OctopusAccountFieldSensor(
+            account,
+            coordinator,
+            source_key="billing",
+            key="next_billing_date",
+            name="Próxima Facturación",
+            icon="mdi:calendar-clock",
+            device_class=SensorDeviceClass.DATE,
+            value_fn=lambda b: _coerce_date(b.get("next_billing_date")),
+            attrs_fn=lambda b: {
+                "period_start": b.get("period_start"),
+                "period_end": b.get("period_end"),
+                "is_fixed": b.get("is_fixed"),
+                "period_start_day": b.get("period_start_day"),
+            },
+        ),
+        OctopusAccountFieldSensor(
+            account,
+            coordinator,
+            source_key="payment_forecast",
+            key="next_payment_amount",
+            name="Próximo Pago",
+            icon="mdi:cash-clock",
+            unit=CURRENCY_EURO,
+            state_class=SensorStateClass.MEASUREMENT,
+            value_fn=lambda f: f.get("amount"),
+            attrs_fn=lambda f: {"date": f.get("date")},
+        ),
+    ]
 
 
 class OctopusConsumptionStatisticsSensor(
