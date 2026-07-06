@@ -105,27 +105,47 @@ class OctopusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             current_invoice = current.get("last_invoice", {}) if isinstance(current, dict) else {}
             current_pdf = current_invoice.get("pdf")
 
-            refreshed = await self._api.account(account)
-            if not refreshed:
+            try:
+                refreshed = await self._api.account(account)
+                if not refreshed:
+                    return False
+
+                refreshed_invoice = (
+                    refreshed.get("last_invoice", {}) if isinstance(refreshed, dict) else {}
+                )
+                refreshed_pdf = refreshed_invoice.get("pdf")
+                refreshed_needs_retry = _invoice_pdf_needs_refresh(refreshed_invoice)
+                current_needs_refresh = _invoice_pdf_needs_refresh(current_invoice)
+
+                if refreshed_needs_retry and (
+                    refreshed_pdf == current_pdf or current_needs_refresh
+                ):
+                    _LOGGER.debug(
+                        "Invoice refresh for %s returned a stale or expiring PDF URL; retrying with fresh login",
+                        account,
+                    )
+                    relogged = await self._api.account(account, force_login=True)
+                    if relogged:
+                        refreshed = relogged
+                        refreshed_invoice = (
+                            refreshed.get("last_invoice", {})
+                            if isinstance(refreshed, dict)
+                            else {}
+                        )
+            except Exception:
+                _LOGGER.warning(
+                    "Invoice refresh for account %s failed", account, exc_info=True
+                )
                 return False
 
-            refreshed_invoice = (
-                refreshed.get("last_invoice", {}) if isinstance(refreshed, dict) else {}
-            )
-            refreshed_pdf = refreshed_invoice.get("pdf")
-            refreshed_needs_retry = _invoice_pdf_needs_refresh(refreshed_invoice)
-            current_needs_refresh = _invoice_pdf_needs_refresh(current_invoice)
-
-            if refreshed_needs_retry and (
-                refreshed_pdf == current_pdf or current_needs_refresh
-            ):
+            if refreshed_invoice.get("id") is None:
+                # The API returned the empty fallback payload; keep the data
+                # we already have instead of clobbering it with None values.
                 _LOGGER.debug(
-                    "Invoice refresh for %s returned a stale or expiring PDF URL; retrying with fresh login",
+                    "Invoice refresh for %s returned no invoice data; keeping current data",
                     account,
                 )
-                relogged = await self._api.account(account, force_login=True)
-                if relogged:
-                    refreshed = relogged
+                return False
 
             merged = {**current, **refreshed}
             if "hourly_consumption" in current and "hourly_consumption" not in merged:

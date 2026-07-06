@@ -14,6 +14,35 @@ ELECTRICITY_LEDGER = "SPAIN_ELECTRICITY_LEDGER"
 _LOGGER = logging.getLogger(__name__)
 
 
+def _empty_account_payload(
+    solar_wallet: Optional[float] = None,
+    octopus_credit: Optional[float] = None,
+) -> dict:
+    """Fallback account payload used when billing data cannot be fetched."""
+    return {
+        'solar_wallet': solar_wallet,
+        'octopus_credit': octopus_credit,
+        'last_invoice': {
+            # Primary value and mirrors
+            'amount': None,
+            'invoiced_amount': None,
+            # Totals
+            'gross_total': None,
+            'net_total': None,
+            'tax_total': None,
+            # Dates and identifiers
+            'issued': None,
+            'earliest_charge_at': None,
+            'pdf': None,
+            'pdf_expires_at': None,
+            'id': None,
+            # Legacy fields kept for compatibility
+            'start': None,
+            'end': None,
+        }
+    }
+
+
 def _parse_presigned_url_expiry(url: Optional[str]) -> Optional[str]:
     """Return the UTC expiration timestamp for a presigned URL."""
     if not url:
@@ -322,28 +351,7 @@ class OctopusSpain:
                     "Unable to fetch billing info for account %s due to login failure",
                     account,
                 )
-                return {
-                    'solar_wallet': None,
-                    'octopus_credit': None,
-                    'last_invoice': {
-                        # Primary value and mirrors
-                        'amount': None,
-                        'invoiced_amount': None,
-                        # Totals
-                        'gross_total': None,
-                        'net_total': None,
-                        'tax_total': None,
-                        # Dates and identifiers
-                        'issued': None,
-                        'earliest_charge_at': None,
-                        'pdf': None,
-                        'pdf_expires_at': None,
-                        'id': None,
-                        # Legacy fields kept for compatibility
-                        'start': None,
-                        'end': None,
-                    }
-                }
+                return _empty_account_payload()
 
         # --- Helpers: proper timezone-aware conversion ---
         def _to_local_date_str(iso_str: Optional[str]) -> Optional[str]:
@@ -401,31 +409,28 @@ class OctopusSpain:
         headers = {"authorization": self._token}
         client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
         response = await client.execute_async(query, {"account": account})
-        if response is None or "errors" in response:
+        if not isinstance(response, dict) or "errors" in response:
             _LOGGER.error(
                 "Failed to fetch billing info for account %s: %s",
                 account,
-                response.get("errors") if response else "no response from API",
+                response.get("errors") if isinstance(response, dict) else "no response from API",
             )
-            return {
-                'solar_wallet': None,
-                'octopus_credit': None,
-                'last_invoice': {
-                    'amount': None,
-                    'invoiced_amount': None,
-                    'gross_total': None,
-                    'net_total': None,
-                    'tax_total': None,
-                    'issued': None,
-                    'earliest_charge_at': None,
-                    'pdf': None,
-                    'pdf_expires_at': None,
-                    'id': None,
-                    'start': None,
-                    'end': None,
-                }
-            }
-        ledgers = response.get("data", {}).get("account", {}).get("ledgers", [])
+            return _empty_account_payload()
+
+        # The API can return {"data": null} or {"data": {"account": null}}
+        # without an "errors" key; chained .get(..., {}) does not protect
+        # against explicit nulls (see issue #29).
+        data = response.get("data")
+        account_data = (data or {}).get("account") or {}
+        if not account_data:
+            _LOGGER.error(
+                "Billing info response contained no account data for account %s: %s",
+                account,
+                response.get("errors") or "null data",
+            )
+            return _empty_account_payload()
+
+        ledgers = account_data.get("ledgers") or []
         if not isinstance(ledgers, list):
             _LOGGER.error(
                 "Billing info ledgers payload unexpected for account %s: %s",
@@ -433,11 +438,17 @@ class OctopusSpain:
                 type(ledgers).__name__,
             )
             ledgers = []
-        electricity = next(filter(lambda x: x['ledgerType'] == ELECTRICITY_LEDGER, ledgers), None)
-        solar_wallet = next(filter(lambda x: x['ledgerType'] == SOLAR_WALLET_LEDGER, ledgers), {'balance': 0})
+        ledgers = [ledger for ledger in ledgers if isinstance(ledger, dict)]
+        electricity = next(filter(lambda x: x.get('ledgerType') == ELECTRICITY_LEDGER, ledgers), None)
+        solar_wallet = next(filter(lambda x: x.get('ledgerType') == SOLAR_WALLET_LEDGER, ledgers), {'balance': 0})
 
         if not electricity:
-            raise Exception("Electricity ledger not found")
+            _LOGGER.warning(
+                "Electricity ledger not found in billing info for account %s (ledgers: %s)",
+                account,
+                [ledger.get('ledgerType') for ledger in ledgers],
+            )
+            return _empty_account_payload()
 
         invs = electricity.get("invoices") or {}
         invoices = invs.get("edges") or []
@@ -456,28 +467,11 @@ class OctopusSpain:
         )
 
         if len(invoices) == 0:
-            return {
-                'solar_wallet': None,
-                'octopus_credit': None,
-                'last_invoice': {
-                    # Primary value and mirrors
-                    'amount': None,
-                    'invoiced_amount': None,
-                    # Totals
-                    'gross_total': None,
-                    'net_total': None,
-                    'tax_total': None,
-                    # Dates and identifiers
-                    'issued': None,
-                    'earliest_charge_at': None,
-                    'pdf': None,
-                    'pdf_expires_at': None,
-                    'id': None,
-                    # Legacy fields kept for compatibility
-                    'start': None,
-                    'end': None,
-                }
-            }
+            # Ledgers are valid even without invoices: keep the balances.
+            return _empty_account_payload(
+                solar_wallet=(float(solar_wallet.get("balance", 0)) / 100),
+                octopus_credit=(float(electricity.get("balance", 0)) / 100),
+            )
 
         invoice = invoices[0].get("node", {}) if isinstance(invoices[0], dict) else {}
 
