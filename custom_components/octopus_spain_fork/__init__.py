@@ -24,6 +24,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: OctopusSpainConfigEntry)
     )
     entry.runtime_data = OctopusSpainRuntimeData(coordinator=coordinator)
 
+    # Ensure config/www/octopus_spain_fork exists: HA only serves /local/ when
+    # config/www existed at startup, so create it as early as possible.
+    await hass.async_add_executor_job(coordinator.pdf_manager.ensure_base_dir)
+
     await hass.async_add_executor_job(importlib.import_module, f"{__name__}.sensor")
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
