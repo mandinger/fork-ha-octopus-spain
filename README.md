@@ -51,7 +51,7 @@ Podrás cambiar el método más tarde desde las Opciones de la integración. Par
 
 
 ## Entidades
-Una vez configurado el componente, tendrás dos entidades por cada cuenta que tengas asociada a tu email (normalmente una).
+Una vez configurado el componente, tendrás un conjunto de entidades por cada cuenta que tengas asociada a tu email (normalmente una). La referencia completa de entidades, atributos y servicios está en [docs/FEATURES.md](docs/FEATURES.md); el backlog de mejoras en [docs/IMPROVEMENTS.md](docs/IMPROVEMENTS.md).
 
 ### Solar Wallet
 La entidad Solar Wallet devuelve el valor actual de tu Solar Wallet. Este valor (en euros) estará actualizado al de tu última factura. Actualmente no se puede consultar en tiempo real.
@@ -73,12 +73,31 @@ Además del sensor agregado "Última Factura Octopus", el componente expone sens
 - sensor.factura_impuestos: Impuestos (€)
 - sensor.factura_emitida: Fecha de emisión (fecha)
 - sensor.factura_inicio_cargos: Inicio de cargos (fecha)
-- sensor.factura_pdf: Estado del PDF (atributo url con el enlace)
+- sensor.factura_pdf: Estado del PDF (atributos url remota y copia local)
 - sensor.factura_id: Identificador de la factura
 
 Nota: Si tienes varias cuentas en Octopus, los nombres visibles de las entidades incluirán el identificador de la cuenta entre paréntesis, p. ej. "Factura (mi_cuenta): Total neto".
 
 Para ver una tarjeta de ejemplo con estos sensores, consulta el panel de muestra en [ha/dashboard.yml](ha/dashboard.yml).
+
+### PDF de la factura (descarga local)
+El enlace de PDF que devuelve Octopus es una URL firmada que **caduca a los pocos minutos**. Para que siempre tengas un enlace válido, la integración descarga automáticamente el PDF de la última factura y lo guarda en `config/www/octopus_spain_fork/`, sirviéndolo en una URL permanente `/local/octopus_spain_fork/<cuenta>/invoice_<id>.pdf` (atributos `PDF local` del sensor de factura y `local_url` del sensor PDF).
+
+⚠️ **Privacidad**: Home Assistant sirve `config/www` sin autenticación a cualquier dispositivo que alcance tu instancia; ten en cuenta que las facturas contienen datos personales.
+
+También existe el servicio `octopus_spain_fork.download_invoice` para forzar la descarga:
+
+```yaml
+service: octopus_spain_fork.download_invoice
+data:
+  account: "A-12345678"  # opcional
+```
+
+### Tarifa y contrato
+Sensores con tu tarifa actual y sus precios: nombre de tarifa, precio de la energía (€/kWh), precio de la potencia, compensación de excedentes (si aplica), potencia contratada (kW) y CUPS (diagnóstico). Detalles en [docs/FEATURES.md](docs/FEATURES.md).
+
+### Próxima facturación y pago
+Sensores con la fecha de la próxima facturación (con el periodo en curso como atributos) y el importe previsto del próximo pago.
 
 
 ## Consumo eléctrico (estadísticas)
@@ -92,6 +111,13 @@ El componente no ofrece consumo en tiempo real. En su lugar, importa de forma re
 - Unidad: kWh.
 - Identificador de estadística (`statistic_id`): `octopus_spain_fork:energy_consumption_<cuenta_slug>`.
 - Nombre mostrado en HA: "Consumo Electrico" o "Consumo Electrico (<cuenta>)" cuando hay varias cuentas.
+
+### Excedente solar (estadísticas)
+Si tu cuenta tiene Solar Wallet, el componente también importa la energía **exportada a la red** (generación) como estadística acumulada:
+
+- Identificador: `octopus_spain_fork:energy_export_<cuenta_slug>` ("Excedente Solar").
+- Puedes seleccionarla como **"Retorno a la red"** en el Panel de Energía.
+- Las horas sin producción (noche) que la API omite se rellenan con 0 tras confirmarlas contra los totales diarios.
 
 Uso en interfaz:
 - Tarjeta "Gráfico de estadísticas": selecciona la estadística con el nombre anterior para visualizar la serie acumulada por horas.
