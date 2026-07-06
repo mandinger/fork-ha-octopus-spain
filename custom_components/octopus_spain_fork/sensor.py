@@ -46,7 +46,7 @@ try:
     from homeassistant.components.recorder.statistics import async_update_statistics_metadata
 except ImportError:  # pragma: no cover - older Home Assistant versions
     async_update_statistics_metadata = None
-from .const import CONSUMPTION_IMPORT_DELAY_DAYS, DOMAIN
+from .const import CONSUMPTION_IMPORT_DELAY_DAYS, DOMAIN, STAT_PREFIX_EXPORT
 from .coordinator import OctopusCoordinator
 from .runtime import OctopusSpainConfigEntry
 
@@ -74,6 +74,16 @@ def _consumption_statistic_id(account: str) -> str:
 def _consumption_unique_id(account: str) -> str:
     """Return the stable entity registry unique_id for the consumption sensor."""
     return f"energy_consumption_{_account_slug(account)}"
+
+
+def _export_statistic_id(account: str) -> str:
+    """Return the external recorder statistic_id for imported solar export."""
+    return f"{DOMAIN}:{STAT_PREFIX_EXPORT}_{_account_slug(account)}"
+
+
+def _export_unique_id(account: str) -> str:
+    """Return the stable entity registry unique_id for the export sensor."""
+    return f"{STAT_PREFIX_EXPORT}_{_account_slug(account)}"
 
 
 def _legacy_consumption_unique_id(account: str) -> str:
@@ -178,6 +188,13 @@ async def async_setup_entry(
             account, coordinator, single_account
         )
         sensors.append(consumption_sensor)
+
+        # Solar export statistics: only for accounts with a Solar Wallet, so
+        # non-solar users get no entity and no GENERATION queries at all.
+        if (coordinator.data.get(account) or {}).get("has_solar_wallet"):
+            sensors.append(
+                OctopusExportStatisticsSensor(account, coordinator, single_account)
+            )
 
         # Individual Last Invoice fields
         name_prefix = _account_name("Factura", account)
@@ -919,6 +936,10 @@ class OctopusConsumptionStatisticsSensor(
             native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         )
 
+    def _importer_kwargs(self) -> dict[str, Any]:
+        """Extra importer arguments; overridden by direction-specific sensors."""
+        return {}
+
     async def async_added_to_hass(self) -> None:
         """Start importing statistics once Home Assistant has assigned entity_id."""
         await super().async_added_to_hass()
@@ -929,6 +950,7 @@ class OctopusConsumptionStatisticsSensor(
             single=self._single,
             statistic_id=self._statistic_id,
             state_callback=self.async_set_native_value,
+            **self._importer_kwargs(),
         )
         self.async_on_remove(self._importer.close)
         await self._importer.async_setup()
@@ -969,6 +991,43 @@ class OctopusConsumptionStatisticsSensor(
     def statistic_id(self) -> str:
         """Return the statistic id used by the Energy Dashboard for this sensor."""
         return self._statistic_id
+
+
+class OctopusExportStatisticsSensor(OctopusConsumptionStatisticsSensor):
+    """Expose imported solar export (generation) statistics.
+
+    Only created for accounts with a Solar Wallet ledger; usable as
+    "Return to grid" in the Energy Dashboard via its statistic_id.
+    """
+
+    def __init__(
+        self,
+        account: str,
+        coordinator: OctopusCoordinator,
+        single: bool,
+    ) -> None:
+        super().__init__(account, coordinator, single)
+        self._attr_name = _account_name("Excedente Solar", account)
+        self._attr_unique_id = _export_unique_id(account)
+        self._statistic_id = _export_statistic_id(account)
+        self.entity_description = SensorEntityDescription(
+            key=self._attr_unique_id,
+            icon="mdi:transmission-tower-export",
+            device_class=SensorDeviceClass.ENERGY,
+            native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        )
+
+    def _importer_kwargs(self) -> dict[str, Any]:
+        return {
+            "name": _account_name("Excedente Solar", self._account),
+            "seed_key": "hourly_generation",
+            "fetch_hourly": self.coordinator.async_fetch_hourly_generation,
+            "fetch_daily": self.coordinator.async_fetch_daily_generation,
+            # Generation data omits hours without production (night);
+            # without zero-fill every day would look incomplete.
+            "fill_missing_hours_as_zero": True,
+            "log_label": "OctopusExportStats",
+        }
 
 
 class OctopusConsumptionStatisticsImporter:
