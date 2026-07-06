@@ -401,6 +401,30 @@ class OctopusSpain:
         headers = {"authorization": self._token}
         client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
         response = await client.execute_async(query, {"account": account})
+        if response is None or "errors" in response:
+            _LOGGER.error(
+                "Failed to fetch billing info for account %s: %s",
+                account,
+                response.get("errors") if response else "no response from API",
+            )
+            return {
+                'solar_wallet': None,
+                'octopus_credit': None,
+                'last_invoice': {
+                    'amount': None,
+                    'invoiced_amount': None,
+                    'gross_total': None,
+                    'net_total': None,
+                    'tax_total': None,
+                    'issued': None,
+                    'earliest_charge_at': None,
+                    'pdf': None,
+                    'pdf_expires_at': None,
+                    'id': None,
+                    'start': None,
+                    'end': None,
+                }
+            }
         ledgers = response.get("data", {}).get("account", {}).get("ledgers", [])
         if not isinstance(ledgers, list):
             _LOGGER.error(
