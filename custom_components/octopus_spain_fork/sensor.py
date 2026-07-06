@@ -459,6 +459,9 @@ class OctopusInvoice(_InvoiceRefreshMixin, SensorEntity):
                 'PDF': inv.get('pdf'),
                 'PDF caduca': pdf_expires_at.isoformat() if pdf_expires_at else None,
                 'PDF expirada': pdf_is_expired,
+                # Durable local copy (does not expire, see invoice_pdf.py)
+                'PDF local': inv.get('local_url'),
+                'PDF local path': inv.get('local_path'),
             }
 
             _LOGGER.debug(
@@ -573,13 +576,20 @@ class OctopusInvoiceFieldSensor(_InvoiceRefreshMixin, SensorEntity):
                 if self._field == "pdf":
                     url = str(raw) if raw is not None else None
                     expires_at, is_expired = _invoice_pdf_status(inv)
+                    local_url = inv.get("local_url")
                     self._attrs = {
                         "url": url,
                         "expires_at": expires_at.isoformat() if expires_at else None,
                         "is_expired": is_expired,
-                    } if url else {}
-                    # keep state short and indicative
-                    self._state = "expired" if is_expired else "available" if url else None
+                        # Durable local copy (does not expire)
+                        "local_url": local_url,
+                        "local_path": inv.get("local_path"),
+                    } if (url or local_url) else {}
+                    # keep state short and indicative; a local copy never expires
+                    if local_url:
+                        self._state = "downloaded"
+                    else:
+                        self._state = "expired" if is_expired else "available" if url else None
                 else:
                     self._state = raw if raw is not None else None
 

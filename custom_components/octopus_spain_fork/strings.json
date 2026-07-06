@@ -57,5 +57,17 @@
         }
       }
     }
+  },
+  "services": {
+    "download_invoice": {
+      "name": "Download invoice PDF",
+      "description": "Downloads the latest invoice PDF and stores it under config/www so it is served at a durable /local/ URL.",
+      "fields": {
+        "account": {
+          "name": "Account",
+          "description": "Octopus account number. When omitted, the invoice is downloaded for every account."
+        }
+      }
+    }
   }
 }

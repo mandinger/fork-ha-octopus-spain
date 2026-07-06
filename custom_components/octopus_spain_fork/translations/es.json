@@ -65,5 +65,17 @@
         }
       }
     }
+  },
+  "services": {
+    "download_invoice": {
+      "name": "Descargar factura PDF",
+      "description": "Descarga el PDF de la última factura y lo guarda en config/www para servirlo en una URL /local/ permanente.",
+      "fields": {
+        "account": {
+          "name": "Cuenta",
+          "description": "Número de cuenta de Octopus. Si se omite, se descarga la factura de todas las cuentas."
+        }
+      }
+    }
   }
 }
