@@ -982,6 +982,13 @@ class OctopusConsumptionStatisticsImporter:
         single: bool,
         statistic_id: str,
         state_callback: Callable[[float | None, Mapping[str, Any] | None], None],
+        *,
+        name: str | None = None,
+        seed_key: str = "hourly_consumption",
+        fetch_hourly: Callable[..., Any] | None = None,
+        fetch_daily: Callable[..., Any] | None = None,
+        fill_missing_hours_as_zero: bool = False,
+        log_label: str = "OctopusConsumptionStats",
     ) -> None:
         self._hass = hass
         self._coordinator = coordinator
@@ -989,7 +996,14 @@ class OctopusConsumptionStatisticsImporter:
         self._single = single
         self._state_callback = state_callback
         self._statistic_id = statistic_id
-        self._name = _account_name("Consumo Electrico", account)
+        self._name = name or _account_name("Consumo Electrico", account)
+        self._seed_key = seed_key
+        self._fetch_hourly = fetch_hourly or coordinator.async_fetch_hourly_consumption
+        self._fetch_daily = fetch_daily or coordinator.async_fetch_daily_consumption
+        # GENERATION measurements legitimately omit hours without production
+        # (e.g. night); zero-fill keeps those days importable.
+        self._fill_missing_hours_as_zero = fill_missing_hours_as_zero
+        self._log_label = log_label
         self._remove_listener: Callable[[], None] | None = None
         self._metadata_updated = False
         self._reconcile_warning_fingerprint_by_day: dict[date, tuple[int, float, float]] = {}
@@ -1125,7 +1139,7 @@ class OctopusConsumptionStatisticsImporter:
 
         range_start = self._local_day_start_utc(month_start_day)
         range_end = self._local_day_start_utc(complete_until + timedelta(days=1))
-        daily_rows = await self._coordinator.async_fetch_daily_consumption(
+        daily_rows = await self._fetch_daily(
             self._account,
             range_start,
             range_end,
@@ -1250,7 +1264,7 @@ class OctopusConsumptionStatisticsImporter:
     ) -> bool:
         day_start = self._local_day_start_utc(day)
         day_end = self._local_day_start_utc(day + timedelta(days=1))
-        hourly_rows = await self._coordinator.async_fetch_hourly_consumption(
+        hourly_rows = await self._fetch_hourly(
             self._account,
             day_start,
             day_end,
@@ -1424,7 +1438,7 @@ class OctopusConsumptionStatisticsImporter:
 
         range_start = self._local_day_start_utc(compare_start_day)
         range_end = self._local_day_start_utc(complete_until + timedelta(days=1))
-        daily_rows = await self._coordinator.async_fetch_daily_consumption(
+        daily_rows = await self._fetch_daily(
             self._account,
             range_start,
             range_end,
@@ -1575,6 +1589,19 @@ class OctopusConsumptionStatisticsImporter:
             if not missing_starts:
                 continue
 
+            if self._fill_missing_hours_as_zero and day < today_local:
+                # Hours without production are legitimately absent from the
+                # API; treat past-day gaps as zero instead of dropping the day.
+                for start_utc in missing_starts:
+                    measurements_by_start[start_utc] = 0.0
+                _LOGGER.debug(
+                    "%s: filled %s missing hour(s) with zero on %s (fill_missing_hours_as_zero)",
+                    prefix,
+                    len(missing_starts),
+                    day.isoformat(),
+                )
+                continue
+
             day_starts = [
                 start_utc
                 for start_utc in measurements_by_start
@@ -1682,7 +1709,7 @@ class OctopusConsumptionStatisticsImporter:
 
         range_start = self._local_day_start_utc(range_start_day)
         range_end = self._local_day_start_utc(complete_until + timedelta(days=1))
-        daily_rows = await self._coordinator.async_fetch_daily_consumption(
+        daily_rows = await self._fetch_daily(
             self._account,
             range_start,
             range_end,
@@ -1749,9 +1776,9 @@ class OctopusConsumptionStatisticsImporter:
         return filled
 
     async def _async_process_update(self) -> None:
-        prefix = f"OctopusConsumptionStats[{self._account}]"
+        prefix = f"{self._log_label}[{self._account}]"
         try:
-            measurements_raw = self._coordinator.data[self._account].get("hourly_consumption", [])
+            measurements_raw = self._coordinator.data[self._account].get(self._seed_key, [])
             meas_count = len(measurements_raw) if isinstance(measurements_raw, list) else "unknown"
             _LOGGER.debug(
                 "%s: fetched hourly measurements count=%s type=%s",
@@ -1834,7 +1861,7 @@ class OctopusConsumptionStatisticsImporter:
             }
             _LOGGER.debug("%s: filled metadata statistics metadata=%s", prefix, metadata)
 
-            fetched = await self._coordinator.async_fetch_hourly_consumption(
+            fetched = await self._fetch_hourly(
                 self._account,
                 import_start_utc,
                 import_end_utc,
@@ -1935,6 +1962,18 @@ class OctopusConsumptionStatisticsImporter:
                         continue
                     preserved_existing_values_by_start[start_utc] = value
 
+            zero_filled_hours = 0
+            if self._fill_missing_hours_as_zero and api_measurements_by_start:
+                # Fill confirmed zero hours before truncation so days whose
+                # gaps are legitimate (no production) are not discarded.
+                zero_filled_hours = await self._async_fill_confirmed_zero_hours(
+                    prefix=prefix,
+                    measurements_by_start=api_measurements_by_start,
+                    import_start_utc=import_start_utc,
+                    today_local=dt_util.as_local(now_utc).date(),
+                )
+                api_measurement_starts.update(api_measurements_by_start)
+
             api_measurements_by_start, truncated_from_day = self._truncate_incomplete_days(
                 prefix=prefix,
                 measurements_by_start=api_measurements_by_start,
@@ -2014,8 +2053,6 @@ class OctopusConsumptionStatisticsImporter:
                     prefix,
                 )
                 return
-
-            zero_filled_hours = 0
 
             # Diagnostic-only comparison to help identify discrepancies with official app totals.
             await self._async_compare_hourly_vs_daily(
