@@ -12,7 +12,9 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import (
     CURRENCY_EURO,
+    EntityCategory,
     UnitOfEnergy,
+    UnitOfPower,
 )
 try:
     from homeassistant.const import MATCH_ALL
@@ -110,6 +112,22 @@ def _remove_legacy_consumption_entities(
                 entity_entry.entity_id,
                 entity_entry.unique_id,
             )
+
+
+def _coerce_date(raw: Any) -> date | None:
+    """Coerce an API value (date/datetime/ISO string) into a date."""
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            parsed = dt_util.parse_datetime(raw)
+            if parsed is not None:
+                return dt_util.as_local(parsed).date()
+    return None
 
 
 def _parse_invoice_pdf_expiry(invoice: Mapping[str, Any]) -> datetime | None:
@@ -243,6 +261,12 @@ async def async_setup_entry(
                     icon="mdi:identifier",
                 ),
             ]
+        )
+
+        # Contract / tariff sensors (unavailable until contract data arrives)
+        account_data = coordinator.data.get(account) or {}
+        sensors.extend(
+            _contract_sensors(account, coordinator, account_data.get("contract"))
         )
     async_add_entities(sensors)
 
@@ -551,20 +575,7 @@ class OctopusInvoiceFieldSensor(_InvoiceRefreshMixin, SensorEntity):
                 getattr(self.entity_description, "device_class", None)
                 == SensorDeviceClass.DATE
             ):
-                val: date | None = None
-                if isinstance(raw, date):
-                    val = raw
-                elif isinstance(raw, datetime):
-                    val = raw.date()
-                elif isinstance(raw, str):
-                    # Expect YYYY-MM-DD; fall back to parse_datetime
-                    try:
-                        val = date.fromisoformat(raw)
-                    except Exception:
-                        dtp = dt_util.parse_datetime(raw)
-                        if dtp is not None:
-                            val = dt_util.as_local(dtp).date()
-                self._state = val
+                self._state = _coerce_date(raw)
             elif self._is_numeric and raw is not None:
                 try:
                     self._state = float(raw)
@@ -605,6 +616,237 @@ class OctopusInvoiceFieldSensor(_InvoiceRefreshMixin, SensorEntity):
     @property
     def extra_state_attributes(self) -> Mapping[str, Any] | None:
         return self._attrs
+
+
+class OctopusAccountFieldSensor(CoordinatorEntity[OctopusCoordinator], SensorEntity):
+    """Generic sensor over an account-level payload (contract/billing/forecast).
+
+    The payload dict lives at coordinator.data[account][source_key] and may be
+    None when the API could not provide it; the sensor then reports
+    unavailable instead of a bogus state.
+    """
+
+    def __init__(
+        self,
+        account: str,
+        coordinator: OctopusCoordinator,
+        *,
+        source_key: str,
+        key: str,
+        name: str,
+        value_fn: Callable[[Mapping[str, Any]], Any],
+        attrs_fn: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
+        unit_fn: Callable[[Mapping[str, Any]], str | None] | None = None,
+        icon: str | None = None,
+        unit: str | None = None,
+        device_class: SensorDeviceClass | None = None,
+        state_class: SensorStateClass | None = None,
+        entity_category: EntityCategory | None = None,
+    ) -> None:
+        super().__init__(coordinator=coordinator)
+        self._account = account
+        self._source_key = source_key
+        self._key = key
+        self._value_fn = value_fn
+        self._attrs_fn = attrs_fn
+        self._unit_fn = unit_fn
+        self._state: StateType = None
+        self._attrs: Mapping[str, Any] = {}
+        safe_account = _account_slug(account)
+        self._attr_name = _account_name(name, account)
+        self._attr_entity_id = f"sensor.octopus_{key}_{safe_account}"
+        self._attr_unique_id = f"{key}_{safe_account}"
+        if icon:
+            self._attr_icon = icon
+        if unit:
+            self._attr_native_unit_of_measurement = unit
+        if device_class is not None:
+            self._attr_device_class = device_class
+        if state_class is not None:
+            self._attr_state_class = state_class
+        if entity_category is not None:
+            self._attr_entity_category = entity_category
+
+    def _source(self) -> Mapping[str, Any] | None:
+        account_data = self.coordinator.data.get(self._account) or {}
+        source = account_data.get(self._source_key)
+        return source if isinstance(source, Mapping) else None
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._source() is not None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._handle_coordinator_update()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        prefix = f"OctopusAccountField[{self._account}:{self._key}]"
+        try:
+            source = self._source()
+            if source is None:
+                self._state = None
+                self._attrs = {}
+                self.async_write_ha_state()
+                return
+
+            self._state = self._value_fn(source)
+            self._attrs = self._attrs_fn(source) if self._attrs_fn else {}
+            if self._unit_fn is not None:
+                unit = self._unit_fn(source)
+                if unit:
+                    self._attr_native_unit_of_measurement = unit
+            _LOGGER.debug("%s: state=%s", prefix, self._state)
+            self.async_write_ha_state()
+        except Exception as err:  # pragma: no cover - defensive guard
+            _LOGGER.exception("%s: error updating account field sensor: %s", prefix, err)
+
+    @property
+    def native_value(self) -> StateType:
+        return self._state
+
+    @property
+    def extra_state_attributes(self) -> Mapping[str, Any] | None:
+        return self._attrs
+
+
+def _first(values: Any) -> float | None:
+    """Return the first element of a list-like price/power array."""
+    if isinstance(values, (list, tuple)) and values:
+        return values[0]
+    return None
+
+
+def _second(values: Any) -> float | None:
+    """Return the second element of a list-like price/power array."""
+    if isinstance(values, (list, tuple)) and len(values) > 1:
+        return values[1]
+    return None
+
+
+def _contract_sensors(
+    account: str, coordinator: OctopusCoordinator, contract: Mapping[str, Any] | None
+) -> list[OctopusAccountFieldSensor]:
+    """Build the tariff/contract sensors for one account."""
+
+    def prices(c: Mapping[str, Any]) -> Mapping[str, Any]:
+        return c.get("prices") or {}
+
+    sensors = [
+        OctopusAccountFieldSensor(
+            account,
+            coordinator,
+            source_key="contract",
+            key="tariff",
+            name="Tarifa",
+            icon="mdi:tag-text",
+            value_fn=lambda c: c.get("product_display_name"),
+            attrs_fn=lambda c: {
+                "code": c.get("product_code"),
+                "full_name": c.get("product_full_name"),
+                "valid_from": c.get("valid_from"),
+                "valid_to": c.get("valid_to"),
+                "cups": c.get("cups"),
+                "status": c.get("status"),
+                "supplier_change_in_progress": c.get("supplier_change_in_progress"),
+            },
+        ),
+        OctopusAccountFieldSensor(
+            account,
+            coordinator,
+            source_key="contract",
+            key="energy_price",
+            name="Precio Energía",
+            icon="mdi:currency-eur",
+            unit=f"{CURRENCY_EURO}/kWh",
+            state_class=SensorStateClass.MEASUREMENT,
+            value_fn=lambda c: (
+                _first(prices(c).get("variable_term_with_taxes"))
+                if _first(prices(c).get("variable_term_with_taxes")) is not None
+                else _first(prices(c).get("variable_term"))
+            ),
+            attrs_fn=lambda c: {
+                "variable_term": prices(c).get("variable_term"),
+                "variable_term_with_taxes": prices(c).get("variable_term_with_taxes"),
+                "units": prices(c).get("variable_term_units"),
+                "margin_term": prices(c).get("margin_term"),
+            },
+        ),
+        OctopusAccountFieldSensor(
+            account,
+            coordinator,
+            source_key="contract",
+            key="power_price",
+            name="Precio Potencia",
+            icon="mdi:transmission-tower",
+            unit=f"{CURRENCY_EURO}/kW/día",
+            unit_fn=lambda c: prices(c).get("fixed_term_units"),
+            state_class=SensorStateClass.MEASUREMENT,
+            value_fn=lambda c: (
+                _first(prices(c).get("fixed_term_with_taxes"))
+                if _first(prices(c).get("fixed_term_with_taxes")) is not None
+                else _first(prices(c).get("fixed_term"))
+            ),
+            attrs_fn=lambda c: {
+                "fixed_term": prices(c).get("fixed_term"),
+                "fixed_term_with_taxes": prices(c).get("fixed_term_with_taxes"),
+                "units": prices(c).get("fixed_term_units"),
+                "daily_fee": prices(c).get("daily_fee"),
+                "daily_fee_with_taxes": prices(c).get("daily_fee_with_taxes"),
+            },
+        ),
+        OctopusAccountFieldSensor(
+            account,
+            coordinator,
+            source_key="contract",
+            key="contracted_power",
+            name="Potencia Contratada",
+            icon="mdi:flash",
+            unit=UnitOfPower.KILO_WATT,
+            device_class=SensorDeviceClass.POWER,
+            value_fn=lambda c: _first(c.get("contracted_power")),
+            attrs_fn=lambda c: {
+                "p1": _first(c.get("contracted_power")),
+                "p2": _second(c.get("contracted_power")),
+                "all_periods": c.get("contracted_power"),
+            },
+        ),
+        OctopusAccountFieldSensor(
+            account,
+            coordinator,
+            source_key="contract",
+            key="cups",
+            name="CUPS",
+            icon="mdi:meter-electric",
+            entity_category=EntityCategory.DIAGNOSTIC,
+            value_fn=lambda c: c.get("cups"),
+            attrs_fn=lambda c: {
+                "status": c.get("status"),
+                "self_consumption": c.get("self_consumption"),
+            },
+        ),
+    ]
+
+    # Only surface a surplus price entity when the account can have one,
+    # otherwise non-solar users get a permanently unknown sensor.
+    has_surplus = bool(contract and (contract.get("prices") or {}).get("surplus_rate") is not None)
+    if has_surplus:
+        sensors.append(
+            OctopusAccountFieldSensor(
+                account,
+                coordinator,
+                source_key="contract",
+                key="surplus_price",
+                name="Precio Excedentes",
+                icon="mdi:solar-power",
+                unit=f"{CURRENCY_EURO}/kWh",
+                unit_fn=lambda c: prices(c).get("surplus_rate_units"),
+                state_class=SensorStateClass.MEASUREMENT,
+                value_fn=lambda c: prices(c).get("surplus_rate"),
+            )
+        )
+    return sensors
 
 
 class OctopusConsumptionStatisticsSensor(
