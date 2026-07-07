@@ -56,6 +56,10 @@ data:
 |---|---|---|
 | `sensor.octopus_tariff_<cuenta>` | Nombre de la tarifa | `code`, `full_name`, `valid_from`, `valid_to`, `cups`, `status`, `supplier_change_in_progress` |
 | `sensor.octopus_energy_price_<cuenta>` | Precio energía P1 con impuestos (€/kWh) | Listas completas P1..Pn con/sin impuestos, `margin_term` |
+| `sensor.octopus_current_price_<cuenta>` | **Precio Actual** (€/kWh) del periodo 2.0TD vigente | `period` (P1/P2/P3), `without_taxes`. Se recalcula cada hora (cambio de periodo) usando [tariff-td](https://pypi.org/project/tariff-td/); solo se crea en tarifas de 3 periodos |
+| `sensor.octopus_p1_price_<cuenta>` | Precio Punta con impuestos (€/kWh) | `period`, `without_taxes`, `with_taxes` |
+| `sensor.octopus_p2_price_<cuenta>` | Precio Llano con impuestos (€/kWh) | `period`, `without_taxes`, `with_taxes` |
+| `sensor.octopus_p3_price_<cuenta>` | Precio Valle con impuestos (€/kWh) | `period`, `without_taxes`, `with_taxes` |
 | `sensor.octopus_power_price_<cuenta>` | Precio potencia P1 con impuestos | Listas completas, `daily_fee` |
 | `sensor.octopus_surplus_price_<cuenta>` | Compensación de excedentes (€/kWh) | Solo se crea si tu contrato la tiene |
 | `sensor.octopus_contracted_power_<cuenta>` | Potencia contratada P1 (kW) | `p1`, `p2`, `all_periods` |
@@ -83,7 +87,12 @@ La integración no ofrece consumo en tiempo real: importa retroactivamente los d
 
 - Ambas son sumas acumuladas horarias en kWh.
 - El sensor de excedentes **solo se crea si la cuenta tiene Solar Wallet**. Como la API omite las horas sin producción (noche), esas horas se rellenan con 0 tras confirmarlas contra los totales diarios.
+- **Backfill histórico**: en instalaciones nuevas (sin estadísticas previas) se importan hasta **365 días** de histórico horario, en bloques de 30 días. Las series existentes nunca se retro-rellenan (corrompería las sumas acumuladas).
 - Atributos de diagnóstico: `current_month_imported_total_kwh`, `api_data_through`, `hours_not_yet_available`, `current_month_zero_filled_hours`, etc.
+
+## Consumo del último día
+
+`sensor.octopus_last_day_consumption_<cuenta>` ("Consumo Último Día"): total en kWh del último día con datos horarios disponibles, con el atributo `Fecha`. Útil para tarjetas y automatizaciones sin pasar por estadísticas.
 
 ## Mejoras previstas
 

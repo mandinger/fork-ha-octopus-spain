@@ -96,6 +96,15 @@ data:
 ### Tarifa y contrato
 Sensores con tu tarifa actual y sus precios: nombre de tarifa, precio de la energía (€/kWh), precio de la potencia, compensación de excedentes (si aplica), potencia contratada (kW) y CUPS (diagnóstico). Detalles en [docs/FEATURES.md](docs/FEATURES.md).
 
+### Precio actual y precios por periodo (2.0TD)
+- **Precio Actual**: precio vigente en €/kWh según el periodo 2.0TD en curso (punta/llano/valle, incluyendo fines de semana y festivos), recalculado cada hora mediante [tariff-td](https://pypi.org/project/tariff-td/). Atributos: `period` y precio sin impuestos.
+- **Precio Punta / Llano / Valle**: sensores individuales con el precio de cada periodo (con impuestos; el precio sin impuestos va como atributo).
+
+Estos sensores solo se crean si tu tarifa tiene precios de 3 periodos.
+
+### Consumo del último día
+Sensor "Consumo Último Día" con el total en kWh del último día con datos horarios disponibles (atributo `Fecha`).
+
 ### Próxima facturación y pago
 Sensores con la fecha de la próxima facturación (con el periodo en curso como atributos) y el importe previsto del próximo pago.
 
@@ -106,6 +115,7 @@ El componente no ofrece consumo en tiempo real. En su lugar, importa de forma re
 - Fuente: datos horarios (hourly) de consumo por cuenta.
 - Funcionamiento: en cada actualización se vuelve a consultar el mes natural en curso, usando la zona horaria de Home Assistant, y se reimportan las estadísticas horarias acumuladas en un único `statistic_id` externo estable. Esto permite corregir horas que Octopus publica con retraso o que aparecen días después.
 - Si Octopus todavía no ha publicado datos horarios del mes, se crea una estadística base con el total acumulado anterior para que el Panel de Energía pueda reconocer la estadística.
+- Backfill inicial: en instalaciones nuevas (sin estadísticas previas) se importan hasta 365 días de histórico horario en bloques de 30 días. Las series existentes no se modifican.
 - Diagnóstico: la entidad incluye atributos como `current_month_imported_total_kwh`, `api_data_through`, `hours_not_yet_available`, `current_month_api_hourly_rows`, `current_month_hourly_rows` y `current_month_zero_filled_hours` para comprobar hasta qué hora ha devuelto datos la API.
 - Tipo de dato: estadística externa con suma acumulada por hora.
 - Unidad: kWh.

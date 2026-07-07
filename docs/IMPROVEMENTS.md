@@ -15,8 +15,8 @@ Lista priorizada de mejoras identificadas al revisar el código y la superficie 
 
 ## Robustez / deuda técnica
 
-- **Paginación por cursor en `measurements`**: la query usa `first: 1500` sin `pageInfo { hasNextPage endCursor }`; ventanas grandes truncan datos silenciosamente. El coordinador lo mitiga troceando por días, pero la query debería paginar.
-- **Manejo tipado de errores KT-\***: los errores GraphQL de Kraken llevan códigos (`KT-CT-1124` token caducado, etc.); hoy todos los errores se tratan igual. Distinguir auth vs datos permitiría reintentos más inteligentes.
+- ~~**Paginación por cursor en `measurements`**~~ ✅ Hecho (2026-07-07): la query sigue `pageInfo.endCursor` y concatena páginas de 1500.
+- **Manejo tipado de errores KT-\***: existe `OctopusApiError` para fallos sin datos (2026-07-07), pero los códigos (`KT-CT-1124` token caducado, etc.) siguen sin distinguirse para reintentos más inteligentes.
 - **Expiración del JWT**: no se decodifica `exp` del token; la re-autenticación es reactiva (`force_login=True` tras fallo). Un refresco proactivo evitaría el primer fallo.
 - **Simplificar `_InvoiceRefreshMixin`**: los temporizadores que refrescan la URL firmada 5 min antes de caducar pierden relevancia ahora que el PDF se guarda localmente; se pueden retirar o reducir.
 - **Dividir `sensor.py`** (~2000 líneas): separar en `entity.py` / `statistics.py` / `sensor.py`.
@@ -24,7 +24,8 @@ Lista priorizada de mejoras identificadas al revisar el código y la superficie 
 - **`DeviceInfo` por cuenta**: agrupar las entidades de cada cuenta bajo un dispositivo en el registro de HA.
 - **Almacenamiento privado de PDFs**: opción para guardar en `config/media` (autenticado, accesible vía Media Browser) en lugar de `config/www` (sin autenticación), u opción de ruta configurable.
 - **Arreglar los `timedelta` "chapuzas"** señalados en el comentario de `lib/octopus_spain_fork.py` (ventanas de fechas de la query de facturación).
-- **Tests**: carpeta `tests/` con `pytest-homeassistant-custom-component` y fixtures de payloads reales (hay una prueba offline de regresión del issue #29 descrita en el mensaje de ese fix).
+- ~~**Tests**~~ ✅ Hecho (2026-07-07): carpeta `tests/` con pytest (paginación, `OctopusApiError`, regresiones issue #29 y KT-CT-3949, helpers de sensores) + workflows de CI (tests/ruff/pylint) y `pyproject.toml` con uv. Pendiente: fixtures de payloads reales adicionales y tests de entidades con `pytest-homeassistant-custom-component`.
+- **`_async_reconcile_current_month` está definido pero nunca se llama** (código muerto detectado 2026-07-07): decidir si conectarlo al ciclo de importación o eliminarlo.
 
 ## Ideas de producto
 
