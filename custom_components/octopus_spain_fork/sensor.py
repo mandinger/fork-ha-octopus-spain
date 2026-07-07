@@ -294,6 +294,9 @@ async def async_setup_entry(
         if _tariff_period_prices(account_data.get("contract")):
             sensors.append(OctopusCurrentPrice(account, coordinator))
 
+        # kWh total of the most recent day with hourly data.
+        sensors.append(OctopusLastDayConsumption(account, coordinator))
+
         # Billing cycle and payment forecast
         sensors.extend(_billing_sensors(account, coordinator))
     async_add_entities(sensors)
@@ -765,6 +768,38 @@ TARIFF_PERIOD_INDEX = {"P1": 0, "P2": 1, "P3": 2}
 TARIFF_PERIOD_NAMES = [("P1", "Punta"), ("P2", "Llano"), ("P3", "Valle")]
 
 
+def _last_day_consumption(rows: Any) -> tuple[float, date] | None:
+    """Total kWh of the most recent local day present in hourly measurement rows.
+
+    Rows are the lib's measurement dicts ({value, unit, startAt, endAt}).
+    Returns (total_kwh, day) or None when nothing is parseable.
+    """
+    if not isinstance(rows, list):
+        return None
+    totals_by_day: dict[date, float] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        start_at = row.get("startAt")
+        if not isinstance(start_at, str):
+            continue
+        parsed = dt_util.parse_datetime(start_at)
+        if parsed is None:
+            continue
+        try:
+            value = float(row.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if value < 0:
+            continue
+        day = dt_util.as_local(dt_util.as_utc(parsed)).date()
+        totals_by_day[day] = totals_by_day.get(day, 0.0) + value
+    if not totals_by_day:
+        return None
+    last_day = max(totals_by_day)
+    return round(totals_by_day[last_day], 3), last_day
+
+
 def _tariff_period_prices(contract: Mapping[str, Any] | None) -> dict[str, Any] | None:
     """Return the P1/P2/P3 price arrays from contract data, or None.
 
@@ -1046,6 +1081,54 @@ class OctopusCurrentPrice(CoordinatorEntity[OctopusCoordinator], SensorEntity):
             "prices_include_taxes": period_prices["with_taxes"] is not None,
         }
         self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> StateType:
+        return self._state
+
+    @property
+    def extra_state_attributes(self) -> Mapping[str, Any] | None:
+        return self._attrs
+
+
+class OctopusLastDayConsumption(CoordinatorEntity[OctopusCoordinator], SensorEntity):
+    """Consumption (kWh) of the last day available in the seeded hourly data."""
+
+    def __init__(self, account: str, coordinator: OctopusCoordinator) -> None:
+        super().__init__(coordinator=coordinator)
+        self._account = account
+        self._state: StateType = None
+        self._attrs: Mapping[str, Any] = {}
+        safe_account = _account_slug(account)
+        self._attr_name = _account_name("Consumo Último Día", account)
+        self._attr_unique_id = f"last_day_consumption_{safe_account}"
+        self.entity_description = SensorEntityDescription(
+            key=self._attr_unique_id,
+            icon="mdi:transmission-tower-import",
+            native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            device_class=SensorDeviceClass.ENERGY,
+            state_class=SensorStateClass.TOTAL,
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._update_value()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._update_value()
+        self.async_write_ha_state()
+
+    def _update_value(self) -> None:
+        rows = (self.coordinator.data.get(self._account) or {}).get("hourly_consumption")
+        result = _last_day_consumption(rows)
+        if result is None:
+            self._state = None
+            self._attrs = {}
+            return
+        total, day = result
+        self._state = total
+        self._attrs = {"Fecha": day.isoformat()}
 
     @property
     def native_value(self) -> StateType:
