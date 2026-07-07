@@ -14,6 +14,73 @@ ELECTRICITY_LEDGER = "SPAIN_ELECTRICITY_LEDGER"
 _LOGGER = logging.getLogger(__name__)
 
 
+def _empty_account_payload(
+    solar_wallet: Optional[float] = None,
+    octopus_credit: Optional[float] = None,
+) -> dict:
+    """Fallback account payload used when billing data cannot be fetched."""
+    return {
+        'solar_wallet': solar_wallet,
+        'octopus_credit': octopus_credit,
+        'has_solar_wallet': False,
+        'billing': None,
+        'payment_forecast': None,
+        'last_invoice': {
+            # Primary value and mirrors
+            'amount': None,
+            'invoiced_amount': None,
+            # Totals
+            'gross_total': None,
+            'net_total': None,
+            'tax_total': None,
+            # Dates and identifiers
+            'issued': None,
+            'earliest_charge_at': None,
+            'pdf': None,
+            'pdf_expires_at': None,
+            'id': None,
+            # Legacy fields kept for compatibility
+            'start': None,
+            'end': None,
+        }
+    }
+
+
+def cents_to_eur(value) -> Optional[float]:
+    """Convert an API monetary value in cents to euros."""
+    try:
+        return float(value) / 100 if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_local_date_str(iso_str: Optional[str]) -> Optional[str]:
+    """Parse an ISO8601 datetime string and return local date (YYYY-MM-DD).
+
+    - Accepts timezone-aware or naive inputs; naive treated as UTC.
+    - Returns a string for JSON-serializable HA attributes.
+    """
+    if not iso_str:
+        return None
+    try:
+        dt: Optional[datetime] = dt_util.parse_datetime(iso_str)
+        if dt is None:
+            # Fallback for strict fromisoformat and trailing Z
+            iso_norm = iso_str.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(iso_norm)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt_local = dt_util.as_local(dt)
+        return dt_local.date().isoformat()
+    except Exception:  # pragma: no cover - robust to any parse edge
+        _LOGGER.debug("Failed to parse datetime '%s' for local date", iso_str, exc_info=True)
+        try:
+            # Last ditch: return the first 10 chars if it looks like a date
+            return iso_str[:10]
+        except Exception:
+            return None
+
+
 def _parse_presigned_url_expiry(url: Optional[str]) -> Optional[str]:
     """Return the UTC expiration timestamp for a presigned URL."""
     if not url:
@@ -140,12 +207,41 @@ class OctopusSpain:
             end=end,
         )
 
+    async def hourly_generation(
+        self,
+        account: str,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ):
+        return await self._consumption(
+            account=account,
+            reading_frequency_type="HOUR_INTERVAL",
+            start=start,
+            end=end,
+            reading_direction="GENERATION",
+        )
+
+    async def daily_generation(
+        self,
+        account: str,
+        start: Optional[datetime] = None,
+        end: Optional[datetime] = None,
+    ):
+        return await self._consumption(
+            account=account,
+            reading_frequency_type="DAY_INTERVAL",
+            start=start,
+            end=end,
+            reading_direction="GENERATION",
+        )
+
     async def _consumption(
         self,
         account: str,
         reading_frequency_type: str,
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
+        reading_direction: str = "CONSUMPTION",
     ):
         api_timezone = self._api_timezone_name()
         query = """
@@ -231,7 +327,7 @@ class OctopusSpain:
             "utilityFilters": [
                 {
                     "electricityFilters": {
-                        "readingDirection": "CONSUMPTION",
+                        "readingDirection": reading_direction,
                         "readingFrequencyType": reading_frequency_type,
                     }
                 }
@@ -242,16 +338,18 @@ class OctopusSpain:
         response = await client.execute_async(query, variables)
         if "errors" in response:
             _LOGGER.error(
-                "GraphQL errors while fetching %s consumption for account %s: %s",
+                "GraphQL errors while fetching %s %s for account %s: %s",
                 reading_frequency_type.lower(),
+                reading_direction.lower(),
                 account,
                 response["errors"],
             )
             return []
 
         _LOGGER.debug(
-            "%s consumption query for account %s executed. Start=%s End=%s Timezone=%s",
+            "%s %s query for account %s executed. Start=%s End=%s Timezone=%s",
             reading_frequency_type,
+            reading_direction,
             account,
             variables["startAt"],
             variables["endAt"],
@@ -322,59 +420,18 @@ class OctopusSpain:
                     "Unable to fetch billing info for account %s due to login failure",
                     account,
                 )
-                return {
-                    'solar_wallet': None,
-                    'octopus_credit': None,
-                    'last_invoice': {
-                        # Primary value and mirrors
-                        'amount': None,
-                        'invoiced_amount': None,
-                        # Totals
-                        'gross_total': None,
-                        'net_total': None,
-                        'tax_total': None,
-                        # Dates and identifiers
-                        'issued': None,
-                        'earliest_charge_at': None,
-                        'pdf': None,
-                        'pdf_expires_at': None,
-                        'id': None,
-                        # Legacy fields kept for compatibility
-                        'start': None,
-                        'end': None,
-                    }
-                }
-
-        # --- Helpers: proper timezone-aware conversion ---
-        def _to_local_date_str(iso_str: Optional[str]) -> Optional[str]:
-            """Parse an ISO8601 datetime string and return local date (YYYY-MM-DD).
-
-            - Accepts timezone-aware or naive inputs; naive treated as UTC.
-            - Returns a string for JSON-serializable HA attributes.
-            """
-            if not iso_str:
-                return None
-            try:
-                dt: Optional[datetime] = dt_util.parse_datetime(iso_str)
-                if dt is None:
-                    # Fallback for strict fromisoformat and trailing Z
-                    iso_norm = iso_str.replace("Z", "+00:00")
-                    dt = datetime.fromisoformat(iso_norm)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                dt_local = dt_util.as_local(dt)
-                return dt_local.date().isoformat()
-            except Exception:  # pragma: no cover - robust to any parse edge
-                _LOGGER.debug("Failed to parse datetime '%s' for local date", iso_str, exc_info=True)
-                try:
-                    # Last ditch: return the first 10 chars if it looks like a date
-                    return iso_str[:10]
-                except Exception:
-                    return None
+                return _empty_account_payload()
 
         query = """
             query ($account: String!) {
               account(accountNumber: $account) {
+                billingOptions {
+                  currentBillingPeriodStartDate
+                  currentBillingPeriodEndDate
+                  nextBillingDate
+                  isFixed
+                  periodStartDay
+                }
                 ledgers {
                   ledgerType
                   balance
@@ -401,7 +458,48 @@ class OctopusSpain:
         headers = {"authorization": self._token}
         client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
         response = await client.execute_async(query, {"account": account})
-        ledgers = response.get("data", {}).get("account", {}).get("ledgers", [])
+        if not isinstance(response, dict):
+            _LOGGER.error(
+                "Failed to fetch billing info for account %s: no response from API",
+                account,
+            )
+            return _empty_account_payload()
+
+        # Field-level GraphQL errors come with partial data alongside them;
+        # only give up when there is no usable account payload at all. The
+        # API can also return {"data": null} or {"data": {"account": null}}
+        # without an "errors" key; chained .get(..., {}) does not protect
+        # against explicit nulls (see issue #29).
+        errors = response.get("errors")
+        account_data = (response.get("data") or {}).get("account") or {}
+        if not account_data:
+            _LOGGER.error(
+                "Failed to fetch billing info for account %s: %s",
+                account,
+                errors or "null data",
+            )
+            return _empty_account_payload()
+        if errors:
+            _LOGGER.debug(
+                "Partial GraphQL errors fetching billing info for account %s (continuing with partial data): %s",
+                account,
+                errors,
+            )
+
+        billing_options = account_data.get("billingOptions") or {}
+        billing = {
+            "period_start": billing_options.get("currentBillingPeriodStartDate"),
+            "period_end": billing_options.get("currentBillingPeriodEndDate"),
+            "next_billing_date": billing_options.get("nextBillingDate"),
+            "is_fixed": billing_options.get("isFixed"),
+            "period_start_day": billing_options.get("periodStartDay"),
+        } if billing_options else None
+
+        # Fetched separately: the field errors (KT-CT-3949) on accounts
+        # without forecastable payments and must not poison billing data.
+        payment_forecast = await self.payment_forecast(account)
+
+        ledgers = account_data.get("ledgers") or []
         if not isinstance(ledgers, list):
             _LOGGER.error(
                 "Billing info ledgers payload unexpected for account %s: %s",
@@ -409,11 +507,20 @@ class OctopusSpain:
                 type(ledgers).__name__,
             )
             ledgers = []
-        electricity = next(filter(lambda x: x['ledgerType'] == ELECTRICITY_LEDGER, ledgers), None)
-        solar_wallet = next(filter(lambda x: x['ledgerType'] == SOLAR_WALLET_LEDGER, ledgers), {'balance': 0})
+        ledgers = [ledger for ledger in ledgers if isinstance(ledger, dict)]
+        electricity = next(filter(lambda x: x.get('ledgerType') == ELECTRICITY_LEDGER, ledgers), None)
+        solar_wallet = next(filter(lambda x: x.get('ledgerType') == SOLAR_WALLET_LEDGER, ledgers), None)
+        has_solar_wallet = solar_wallet is not None
+        if solar_wallet is None:
+            solar_wallet = {'balance': 0}
 
         if not electricity:
-            raise Exception("Electricity ledger not found")
+            _LOGGER.warning(
+                "Electricity ledger not found in billing info for account %s (ledgers: %s)",
+                account,
+                [ledger.get('ledgerType') for ledger in ledgers],
+            )
+            return _empty_account_payload()
 
         invs = electricity.get("invoices") or {}
         invoices = invs.get("edges") or []
@@ -432,28 +539,15 @@ class OctopusSpain:
         )
 
         if len(invoices) == 0:
-            return {
-                'solar_wallet': None,
-                'octopus_credit': None,
-                'last_invoice': {
-                    # Primary value and mirrors
-                    'amount': None,
-                    'invoiced_amount': None,
-                    # Totals
-                    'gross_total': None,
-                    'net_total': None,
-                    'tax_total': None,
-                    # Dates and identifiers
-                    'issued': None,
-                    'earliest_charge_at': None,
-                    'pdf': None,
-                    'pdf_expires_at': None,
-                    'id': None,
-                    # Legacy fields kept for compatibility
-                    'start': None,
-                    'end': None,
-                }
-            }
+            # Ledgers are valid even without invoices: keep the balances.
+            payload = _empty_account_payload(
+                solar_wallet=(float(solar_wallet.get("balance", 0)) / 100),
+                octopus_credit=(float(electricity.get("balance", 0)) / 100),
+            )
+            payload["has_solar_wallet"] = has_solar_wallet
+            payload["billing"] = billing
+            payload["payment_forecast"] = payment_forecast
+            return payload
 
         invoice = invoices[0].get("node", {}) if isinstance(invoices[0], dict) else {}
 
@@ -465,12 +559,6 @@ class OctopusSpain:
         net_cents = charges.get("netTotal")
         tax_cents = charges.get("taxTotal")
 
-        def cents_to_eur(value):
-            try:
-                return float(value) / 100 if value is not None else None
-            except (TypeError, ValueError):
-                return None
-
         def parse_iso_date(value: Optional[str]) -> Optional[str]:
             # Keep name for compatibility but use timezone-aware local conversion
             return _to_local_date_str(value)
@@ -478,6 +566,9 @@ class OctopusSpain:
         return {
             "solar_wallet": (float(solar_wallet.get("balance", 0)) / 100),
             "octopus_credit": (float(electricity.get("balance", 0)) / 100),
+            "has_solar_wallet": has_solar_wallet,
+            "billing": billing,
+            "payment_forecast": payment_forecast,
             "last_invoice": {
                 # State (euros): prefer invoicedAmount as the main amount
                 "amount": cents_to_eur(gross_cents),
@@ -493,4 +584,218 @@ class OctopusSpain:
                 "pdf_expires_at": _parse_presigned_url_expiry(invoice.get("pdfUrl")),
                 "id": invoice.get("id"),
             },
+        }
+
+    async def payment_forecast(self, account: str) -> Optional[dict]:
+        """Fetch the next forecasted payment for the account.
+
+        Kept out of the main billing query on purpose: Kraken raises
+        KT-CT-3949 for accounts without forecastable payments, and a
+        field-level error here must never affect billing data.
+        Returns {"amount": eur, "date": str} or None.
+        """
+        if self._token is None:
+            if not await self.login():
+                _LOGGER.warning(
+                    "Unable to fetch payment forecast for account %s due to login failure",
+                    account,
+                )
+                return None
+
+        query = """
+            query getPaymentForecast($account: String!) {
+              account(accountNumber: $account) {
+                paginatedPaymentForecast(first: 1) {
+                  edges {
+                    node {
+                      amount
+                      date
+                    }
+                  }
+                }
+              }
+            }
+        """
+        headers = {"authorization": self._token}
+        client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
+        response = await client.execute_async(query, {"account": account})
+        if not isinstance(response, dict):
+            _LOGGER.warning(
+                "Failed to fetch payment forecast for account %s: no response from API",
+                account,
+            )
+            return None
+
+        errors = response.get("errors") or []
+        if errors:
+            error_codes = {
+                (error.get("extensions") or {}).get("errorCode")
+                for error in errors
+                if isinstance(error, dict)
+            }
+            if error_codes == {"KT-CT-3949"}:
+                # Expected for accounts where forecasts are unavailable.
+                _LOGGER.debug(
+                    "Payment forecast unavailable for account %s (KT-CT-3949)",
+                    account,
+                )
+            else:
+                _LOGGER.warning(
+                    "Failed to fetch payment forecast for account %s: %s",
+                    account,
+                    errors,
+                )
+            return None
+
+        account_data = (response.get("data") or {}).get("account") or {}
+        forecast_edges = (account_data.get("paginatedPaymentForecast") or {}).get("edges") or []
+        forecast_node = (forecast_edges[0] or {}).get("node") if forecast_edges else None
+        if not isinstance(forecast_node, dict):
+            return None
+        return {
+            "amount": cents_to_eur(forecast_node.get("amount")),
+            "date": forecast_node.get("date"),
+        }
+
+    async def supply_points(self, account: str) -> Optional[dict]:
+        """Fetch contract/tariff details for the account's electricity supply point.
+
+        Returns a normalized dict for the first supply point of the first
+        property (multi-CUPS accounts are not yet supported), or None when the
+        data cannot be fetched.
+        """
+        if self._token is None:
+            if not await self.login():
+                _LOGGER.error(
+                    "Unable to fetch supply points for account %s due to login failure",
+                    account,
+                )
+                return None
+
+        query = """
+            query getSupplyPoints($account: String!) {
+              account(accountNumber: $account) {
+                properties {
+                  electricitySupplyPoints {
+                    cups
+                    status
+                    selfConsumption
+                    supplierChangeInProgress
+                    activeAgreement {
+                      validFrom
+                      validTo
+                      product {
+                        code
+                        displayName
+                        fullName
+                        prices {
+                          variableTerm
+                          variableTermWithTaxes
+                          variableTermUnits
+                          fixedTerm
+                          fixedTermWithTaxes
+                          fixedTermUnits
+                          dailyFee
+                          dailyFeeWithTaxes
+                          surplusRate
+                          surplusRateUnits
+                          marginTerm
+                        }
+                      }
+                      details {
+                        contractualMaxPower
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        """
+        headers = {"authorization": self._token}
+        client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
+        response = await client.execute_async(query, {"account": account})
+        if not isinstance(response, dict):
+            _LOGGER.warning(
+                "Failed to fetch supply points for account %s: no response from API",
+                account,
+            )
+            return None
+
+        errors = response.get("errors")
+        account_data = (response.get("data") or {}).get("account") or {}
+        if not account_data:
+            _LOGGER.warning(
+                "Failed to fetch supply points for account %s: %s",
+                account,
+                errors or "null data",
+            )
+            return None
+        if errors:
+            _LOGGER.debug(
+                "Partial GraphQL errors fetching supply points for account %s (continuing with partial data): %s",
+                account,
+                errors,
+            )
+
+        properties = account_data.get("properties") or []
+        supply_point = None
+        for prop in properties:
+            points = (prop or {}).get("electricitySupplyPoints") or []
+            points = [point for point in points if isinstance(point, dict)]
+            if points:
+                supply_point = points[0]
+                if len(points) > 1 or len(properties) > 1:
+                    _LOGGER.debug(
+                        "Account %s has multiple properties/supply points; using the first one",
+                        account,
+                    )
+                break
+        if supply_point is None:
+            _LOGGER.debug("No electricity supply points returned for account %s", account)
+            return None
+
+        agreement = supply_point.get("activeAgreement") or {}
+        product = agreement.get("product") or {}
+        prices = product.get("prices") or {}
+        details = agreement.get("details") or {}
+
+        def to_float_list(values) -> list[float]:
+            result = []
+            for value in values or []:
+                try:
+                    result.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+            return result
+
+        def to_float(value) -> Optional[float]:
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        return {
+            "cups": supply_point.get("cups"),
+            "status": supply_point.get("status"),
+            "self_consumption": supply_point.get("selfConsumption"),
+            "supplier_change_in_progress": supply_point.get("supplierChangeInProgress"),
+            "valid_from": _to_local_date_str(agreement.get("validFrom")),
+            "valid_to": _to_local_date_str(agreement.get("validTo")),
+            "product_code": product.get("code"),
+            "product_display_name": product.get("displayName"),
+            "product_full_name": product.get("fullName"),
+            "prices": {
+                "variable_term": to_float_list(prices.get("variableTerm")),
+                "variable_term_with_taxes": to_float_list(prices.get("variableTermWithTaxes")),
+                "variable_term_units": prices.get("variableTermUnits"),
+                "fixed_term": to_float_list(prices.get("fixedTerm")),
+                "fixed_term_with_taxes": to_float_list(prices.get("fixedTermWithTaxes")),
+                "fixed_term_units": prices.get("fixedTermUnits"),
+                "daily_fee": to_float(prices.get("dailyFee")),
+                "daily_fee_with_taxes": to_float(prices.get("dailyFeeWithTaxes")),
+                "surplus_rate": to_float(prices.get("surplusRate")),
+                "surplus_rate_units": prices.get("surplusRateUnits"),
+                "margin_term": to_float(prices.get("marginTerm")),
+            },
+            "contracted_power": to_float_list(details.get("contractualMaxPower")),
         }

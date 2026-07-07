@@ -1,0 +1,7 @@
+download_invoice:
+  fields:
+    account:
+      required: false
+      example: "A-12345678"
+      selector:
+        text:

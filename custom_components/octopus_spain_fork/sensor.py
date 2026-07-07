@@ -12,7 +12,9 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import (
     CURRENCY_EURO,
+    EntityCategory,
     UnitOfEnergy,
+    UnitOfPower,
 )
 try:
     from homeassistant.const import MATCH_ALL
@@ -44,7 +46,7 @@ try:
     from homeassistant.components.recorder.statistics import async_update_statistics_metadata
 except ImportError:  # pragma: no cover - older Home Assistant versions
     async_update_statistics_metadata = None
-from .const import CONSUMPTION_IMPORT_DELAY_DAYS, DOMAIN
+from .const import CONSUMPTION_IMPORT_DELAY_DAYS, DOMAIN, STAT_PREFIX_EXPORT
 from .coordinator import OctopusCoordinator
 from .runtime import OctopusSpainConfigEntry
 
@@ -72,6 +74,16 @@ def _consumption_statistic_id(account: str) -> str:
 def _consumption_unique_id(account: str) -> str:
     """Return the stable entity registry unique_id for the consumption sensor."""
     return f"energy_consumption_{_account_slug(account)}"
+
+
+def _export_statistic_id(account: str) -> str:
+    """Return the external recorder statistic_id for imported solar export."""
+    return f"{DOMAIN}:{STAT_PREFIX_EXPORT}_{_account_slug(account)}"
+
+
+def _export_unique_id(account: str) -> str:
+    """Return the stable entity registry unique_id for the export sensor."""
+    return f"{STAT_PREFIX_EXPORT}_{_account_slug(account)}"
 
 
 def _legacy_consumption_unique_id(account: str) -> str:
@@ -110,6 +122,22 @@ def _remove_legacy_consumption_entities(
                 entity_entry.entity_id,
                 entity_entry.unique_id,
             )
+
+
+def _coerce_date(raw: Any) -> date | None:
+    """Coerce an API value (date/datetime/ISO string) into a date."""
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            parsed = dt_util.parse_datetime(raw)
+            if parsed is not None:
+                return dt_util.as_local(parsed).date()
+    return None
 
 
 def _parse_invoice_pdf_expiry(invoice: Mapping[str, Any]) -> datetime | None:
@@ -160,6 +188,13 @@ async def async_setup_entry(
             account, coordinator, single_account
         )
         sensors.append(consumption_sensor)
+
+        # Solar export statistics: only for accounts with a Solar Wallet, so
+        # non-solar users get no entity and no GENERATION queries at all.
+        if (coordinator.data.get(account) or {}).get("has_solar_wallet"):
+            sensors.append(
+                OctopusExportStatisticsSensor(account, coordinator, single_account)
+            )
 
         # Individual Last Invoice fields
         name_prefix = _account_name("Factura", account)
@@ -244,6 +279,15 @@ async def async_setup_entry(
                 ),
             ]
         )
+
+        # Contract / tariff sensors (unavailable until contract data arrives)
+        account_data = coordinator.data.get(account) or {}
+        sensors.extend(
+            _contract_sensors(account, coordinator, account_data.get("contract"))
+        )
+
+        # Billing cycle and payment forecast
+        sensors.extend(_billing_sensors(account, coordinator))
     async_add_entities(sensors)
 
 
@@ -459,6 +503,9 @@ class OctopusInvoice(_InvoiceRefreshMixin, SensorEntity):
                 'PDF': inv.get('pdf'),
                 'PDF caduca': pdf_expires_at.isoformat() if pdf_expires_at else None,
                 'PDF expirada': pdf_is_expired,
+                # Durable local copy (does not expire, see invoice_pdf.py)
+                'PDF local': inv.get('local_url'),
+                'PDF local path': inv.get('local_path'),
             }
 
             _LOGGER.debug(
@@ -548,20 +595,7 @@ class OctopusInvoiceFieldSensor(_InvoiceRefreshMixin, SensorEntity):
                 getattr(self.entity_description, "device_class", None)
                 == SensorDeviceClass.DATE
             ):
-                val: date | None = None
-                if isinstance(raw, date):
-                    val = raw
-                elif isinstance(raw, datetime):
-                    val = raw.date()
-                elif isinstance(raw, str):
-                    # Expect YYYY-MM-DD; fall back to parse_datetime
-                    try:
-                        val = date.fromisoformat(raw)
-                    except Exception:
-                        dtp = dt_util.parse_datetime(raw)
-                        if dtp is not None:
-                            val = dt_util.as_local(dtp).date()
-                self._state = val
+                self._state = _coerce_date(raw)
             elif self._is_numeric and raw is not None:
                 try:
                     self._state = float(raw)
@@ -573,13 +607,20 @@ class OctopusInvoiceFieldSensor(_InvoiceRefreshMixin, SensorEntity):
                 if self._field == "pdf":
                     url = str(raw) if raw is not None else None
                     expires_at, is_expired = _invoice_pdf_status(inv)
+                    local_url = inv.get("local_url")
                     self._attrs = {
                         "url": url,
                         "expires_at": expires_at.isoformat() if expires_at else None,
                         "is_expired": is_expired,
-                    } if url else {}
-                    # keep state short and indicative
-                    self._state = "expired" if is_expired else "available" if url else None
+                        # Durable local copy (does not expire)
+                        "local_url": local_url,
+                        "local_path": inv.get("local_path"),
+                    } if (url or local_url) else {}
+                    # keep state short and indicative; a local copy never expires
+                    if local_url:
+                        self._state = "downloaded"
+                    else:
+                        self._state = "expired" if is_expired else "available" if url else None
                 else:
                     self._state = raw if raw is not None else None
 
@@ -595,6 +636,273 @@ class OctopusInvoiceFieldSensor(_InvoiceRefreshMixin, SensorEntity):
     @property
     def extra_state_attributes(self) -> Mapping[str, Any] | None:
         return self._attrs
+
+
+class OctopusAccountFieldSensor(CoordinatorEntity[OctopusCoordinator], SensorEntity):
+    """Generic sensor over an account-level payload (contract/billing/forecast).
+
+    The payload dict lives at coordinator.data[account][source_key] and may be
+    None when the API could not provide it; the sensor then reports
+    unavailable instead of a bogus state.
+    """
+
+    def __init__(
+        self,
+        account: str,
+        coordinator: OctopusCoordinator,
+        *,
+        source_key: str,
+        key: str,
+        name: str,
+        value_fn: Callable[[Mapping[str, Any]], Any],
+        attrs_fn: Callable[[Mapping[str, Any]], dict[str, Any]] | None = None,
+        unit_fn: Callable[[Mapping[str, Any]], str | None] | None = None,
+        icon: str | None = None,
+        unit: str | None = None,
+        device_class: SensorDeviceClass | None = None,
+        state_class: SensorStateClass | None = None,
+        entity_category: EntityCategory | None = None,
+    ) -> None:
+        super().__init__(coordinator=coordinator)
+        self._account = account
+        self._source_key = source_key
+        self._key = key
+        self._value_fn = value_fn
+        self._attrs_fn = attrs_fn
+        self._unit_fn = unit_fn
+        self._state: StateType = None
+        self._attrs: Mapping[str, Any] = {}
+        safe_account = _account_slug(account)
+        self._attr_name = _account_name(name, account)
+        self._attr_entity_id = f"sensor.octopus_{key}_{safe_account}"
+        self._attr_unique_id = f"{key}_{safe_account}"
+        if icon:
+            self._attr_icon = icon
+        if unit:
+            self._attr_native_unit_of_measurement = unit
+        if device_class is not None:
+            self._attr_device_class = device_class
+        if state_class is not None:
+            self._attr_state_class = state_class
+        if entity_category is not None:
+            self._attr_entity_category = entity_category
+
+    def _source(self) -> Mapping[str, Any] | None:
+        account_data = self.coordinator.data.get(self._account) or {}
+        source = account_data.get(self._source_key)
+        return source if isinstance(source, Mapping) else None
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._source() is not None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._handle_coordinator_update()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        prefix = f"OctopusAccountField[{self._account}:{self._key}]"
+        try:
+            source = self._source()
+            if source is None:
+                self._state = None
+                self._attrs = {}
+                self.async_write_ha_state()
+                return
+
+            self._state = self._value_fn(source)
+            self._attrs = self._attrs_fn(source) if self._attrs_fn else {}
+            if self._unit_fn is not None:
+                unit = self._unit_fn(source)
+                if unit:
+                    self._attr_native_unit_of_measurement = unit
+            _LOGGER.debug("%s: state=%s", prefix, self._state)
+            self.async_write_ha_state()
+        except Exception as err:  # pragma: no cover - defensive guard
+            _LOGGER.exception("%s: error updating account field sensor: %s", prefix, err)
+
+    @property
+    def native_value(self) -> StateType:
+        return self._state
+
+    @property
+    def extra_state_attributes(self) -> Mapping[str, Any] | None:
+        return self._attrs
+
+
+def _first(values: Any) -> float | None:
+    """Return the first element of a list-like price/power array."""
+    if isinstance(values, (list, tuple)) and values:
+        return values[0]
+    return None
+
+
+def _second(values: Any) -> float | None:
+    """Return the second element of a list-like price/power array."""
+    if isinstance(values, (list, tuple)) and len(values) > 1:
+        return values[1]
+    return None
+
+
+def _contract_sensors(
+    account: str, coordinator: OctopusCoordinator, contract: Mapping[str, Any] | None
+) -> list[OctopusAccountFieldSensor]:
+    """Build the tariff/contract sensors for one account."""
+
+    def prices(c: Mapping[str, Any]) -> Mapping[str, Any]:
+        return c.get("prices") or {}
+
+    sensors = [
+        OctopusAccountFieldSensor(
+            account,
+            coordinator,
+            source_key="contract",
+            key="tariff",
+            name="Tarifa",
+            icon="mdi:tag-text",
+            value_fn=lambda c: c.get("product_display_name"),
+            attrs_fn=lambda c: {
+                "code": c.get("product_code"),
+                "full_name": c.get("product_full_name"),
+                "valid_from": c.get("valid_from"),
+                "valid_to": c.get("valid_to"),
+                "cups": c.get("cups"),
+                "status": c.get("status"),
+                "supplier_change_in_progress": c.get("supplier_change_in_progress"),
+            },
+        ),
+        OctopusAccountFieldSensor(
+            account,
+            coordinator,
+            source_key="contract",
+            key="energy_price",
+            name="Precio Energía",
+            icon="mdi:currency-eur",
+            unit=f"{CURRENCY_EURO}/kWh",
+            state_class=SensorStateClass.MEASUREMENT,
+            value_fn=lambda c: (
+                _first(prices(c).get("variable_term_with_taxes"))
+                if _first(prices(c).get("variable_term_with_taxes")) is not None
+                else _first(prices(c).get("variable_term"))
+            ),
+            attrs_fn=lambda c: {
+                "variable_term": prices(c).get("variable_term"),
+                "variable_term_with_taxes": prices(c).get("variable_term_with_taxes"),
+                "units": prices(c).get("variable_term_units"),
+                "margin_term": prices(c).get("margin_term"),
+            },
+        ),
+        OctopusAccountFieldSensor(
+            account,
+            coordinator,
+            source_key="contract",
+            key="power_price",
+            name="Precio Potencia",
+            icon="mdi:transmission-tower",
+            unit=f"{CURRENCY_EURO}/kW/día",
+            unit_fn=lambda c: prices(c).get("fixed_term_units"),
+            state_class=SensorStateClass.MEASUREMENT,
+            value_fn=lambda c: (
+                _first(prices(c).get("fixed_term_with_taxes"))
+                if _first(prices(c).get("fixed_term_with_taxes")) is not None
+                else _first(prices(c).get("fixed_term"))
+            ),
+            attrs_fn=lambda c: {
+                "fixed_term": prices(c).get("fixed_term"),
+                "fixed_term_with_taxes": prices(c).get("fixed_term_with_taxes"),
+                "units": prices(c).get("fixed_term_units"),
+                "daily_fee": prices(c).get("daily_fee"),
+                "daily_fee_with_taxes": prices(c).get("daily_fee_with_taxes"),
+            },
+        ),
+        OctopusAccountFieldSensor(
+            account,
+            coordinator,
+            source_key="contract",
+            key="contracted_power",
+            name="Potencia Contratada",
+            icon="mdi:flash",
+            unit=UnitOfPower.KILO_WATT,
+            device_class=SensorDeviceClass.POWER,
+            value_fn=lambda c: _first(c.get("contracted_power")),
+            attrs_fn=lambda c: {
+                "p1": _first(c.get("contracted_power")),
+                "p2": _second(c.get("contracted_power")),
+                "all_periods": c.get("contracted_power"),
+            },
+        ),
+        OctopusAccountFieldSensor(
+            account,
+            coordinator,
+            source_key="contract",
+            key="cups",
+            name="CUPS",
+            icon="mdi:meter-electric",
+            entity_category=EntityCategory.DIAGNOSTIC,
+            value_fn=lambda c: c.get("cups"),
+            attrs_fn=lambda c: {
+                "status": c.get("status"),
+                "self_consumption": c.get("self_consumption"),
+            },
+        ),
+    ]
+
+    # Only surface a surplus price entity when the account can have one,
+    # otherwise non-solar users get a permanently unknown sensor.
+    has_surplus = bool(contract and (contract.get("prices") or {}).get("surplus_rate") is not None)
+    if has_surplus:
+        sensors.append(
+            OctopusAccountFieldSensor(
+                account,
+                coordinator,
+                source_key="contract",
+                key="surplus_price",
+                name="Precio Excedentes",
+                icon="mdi:solar-power",
+                unit=f"{CURRENCY_EURO}/kWh",
+                unit_fn=lambda c: prices(c).get("surplus_rate_units"),
+                state_class=SensorStateClass.MEASUREMENT,
+                value_fn=lambda c: prices(c).get("surplus_rate"),
+            )
+        )
+    return sensors
+
+
+def _billing_sensors(
+    account: str, coordinator: OctopusCoordinator
+) -> list[OctopusAccountFieldSensor]:
+    """Build the billing-cycle and payment-forecast sensors for one account."""
+    return [
+        OctopusAccountFieldSensor(
+            account,
+            coordinator,
+            source_key="billing",
+            key="next_billing_date",
+            name="Próxima Facturación",
+            icon="mdi:calendar-clock",
+            device_class=SensorDeviceClass.DATE,
+            value_fn=lambda b: _coerce_date(b.get("next_billing_date")),
+            attrs_fn=lambda b: {
+                "period_start": b.get("period_start"),
+                "period_end": b.get("period_end"),
+                "is_fixed": b.get("is_fixed"),
+                "period_start_day": b.get("period_start_day"),
+            },
+        ),
+        OctopusAccountFieldSensor(
+            account,
+            coordinator,
+            source_key="payment_forecast",
+            key="next_payment_amount",
+            name="Próximo Pago",
+            icon="mdi:cash-clock",
+            unit=CURRENCY_EURO,
+            state_class=SensorStateClass.MEASUREMENT,
+            value_fn=lambda f: f.get("amount"),
+            attrs_fn=lambda f: {"date": f.get("date")},
+        ),
+    ]
 
 
 class OctopusConsumptionStatisticsSensor(
@@ -628,6 +936,10 @@ class OctopusConsumptionStatisticsSensor(
             native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         )
 
+    def _importer_kwargs(self) -> dict[str, Any]:
+        """Extra importer arguments; overridden by direction-specific sensors."""
+        return {}
+
     async def async_added_to_hass(self) -> None:
         """Start importing statistics once Home Assistant has assigned entity_id."""
         await super().async_added_to_hass()
@@ -638,6 +950,7 @@ class OctopusConsumptionStatisticsSensor(
             single=self._single,
             statistic_id=self._statistic_id,
             state_callback=self.async_set_native_value,
+            **self._importer_kwargs(),
         )
         self.async_on_remove(self._importer.close)
         await self._importer.async_setup()
@@ -680,6 +993,43 @@ class OctopusConsumptionStatisticsSensor(
         return self._statistic_id
 
 
+class OctopusExportStatisticsSensor(OctopusConsumptionStatisticsSensor):
+    """Expose imported solar export (generation) statistics.
+
+    Only created for accounts with a Solar Wallet ledger; usable as
+    "Return to grid" in the Energy Dashboard via its statistic_id.
+    """
+
+    def __init__(
+        self,
+        account: str,
+        coordinator: OctopusCoordinator,
+        single: bool,
+    ) -> None:
+        super().__init__(account, coordinator, single)
+        self._attr_name = _account_name("Excedente Solar", account)
+        self._attr_unique_id = _export_unique_id(account)
+        self._statistic_id = _export_statistic_id(account)
+        self.entity_description = SensorEntityDescription(
+            key=self._attr_unique_id,
+            icon="mdi:transmission-tower-export",
+            device_class=SensorDeviceClass.ENERGY,
+            native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        )
+
+    def _importer_kwargs(self) -> dict[str, Any]:
+        return {
+            "name": _account_name("Excedente Solar", self._account),
+            "seed_key": "hourly_generation",
+            "fetch_hourly": self.coordinator.async_fetch_hourly_generation,
+            "fetch_daily": self.coordinator.async_fetch_daily_generation,
+            # Generation data omits hours without production (night);
+            # without zero-fill every day would look incomplete.
+            "fill_missing_hours_as_zero": True,
+            "log_label": "OctopusExportStats",
+        }
+
+
 class OctopusConsumptionStatisticsImporter:
     """Process coordinator data to feed historical consumption into statistics."""
 
@@ -691,6 +1041,13 @@ class OctopusConsumptionStatisticsImporter:
         single: bool,
         statistic_id: str,
         state_callback: Callable[[float | None, Mapping[str, Any] | None], None],
+        *,
+        name: str | None = None,
+        seed_key: str = "hourly_consumption",
+        fetch_hourly: Callable[..., Any] | None = None,
+        fetch_daily: Callable[..., Any] | None = None,
+        fill_missing_hours_as_zero: bool = False,
+        log_label: str = "OctopusConsumptionStats",
     ) -> None:
         self._hass = hass
         self._coordinator = coordinator
@@ -698,7 +1055,14 @@ class OctopusConsumptionStatisticsImporter:
         self._single = single
         self._state_callback = state_callback
         self._statistic_id = statistic_id
-        self._name = _account_name("Consumo Electrico", account)
+        self._name = name or _account_name("Consumo Electrico", account)
+        self._seed_key = seed_key
+        self._fetch_hourly = fetch_hourly or coordinator.async_fetch_hourly_consumption
+        self._fetch_daily = fetch_daily or coordinator.async_fetch_daily_consumption
+        # GENERATION measurements legitimately omit hours without production
+        # (e.g. night); zero-fill keeps those days importable.
+        self._fill_missing_hours_as_zero = fill_missing_hours_as_zero
+        self._log_label = log_label
         self._remove_listener: Callable[[], None] | None = None
         self._metadata_updated = False
         self._reconcile_warning_fingerprint_by_day: dict[date, tuple[int, float, float]] = {}
@@ -834,7 +1198,7 @@ class OctopusConsumptionStatisticsImporter:
 
         range_start = self._local_day_start_utc(month_start_day)
         range_end = self._local_day_start_utc(complete_until + timedelta(days=1))
-        daily_rows = await self._coordinator.async_fetch_daily_consumption(
+        daily_rows = await self._fetch_daily(
             self._account,
             range_start,
             range_end,
@@ -959,7 +1323,7 @@ class OctopusConsumptionStatisticsImporter:
     ) -> bool:
         day_start = self._local_day_start_utc(day)
         day_end = self._local_day_start_utc(day + timedelta(days=1))
-        hourly_rows = await self._coordinator.async_fetch_hourly_consumption(
+        hourly_rows = await self._fetch_hourly(
             self._account,
             day_start,
             day_end,
@@ -1133,7 +1497,7 @@ class OctopusConsumptionStatisticsImporter:
 
         range_start = self._local_day_start_utc(compare_start_day)
         range_end = self._local_day_start_utc(complete_until + timedelta(days=1))
-        daily_rows = await self._coordinator.async_fetch_daily_consumption(
+        daily_rows = await self._fetch_daily(
             self._account,
             range_start,
             range_end,
@@ -1284,6 +1648,19 @@ class OctopusConsumptionStatisticsImporter:
             if not missing_starts:
                 continue
 
+            if self._fill_missing_hours_as_zero and day < today_local:
+                # Hours without production are legitimately absent from the
+                # API; treat past-day gaps as zero instead of dropping the day.
+                for start_utc in missing_starts:
+                    measurements_by_start[start_utc] = 0.0
+                _LOGGER.debug(
+                    "%s: filled %s missing hour(s) with zero on %s (fill_missing_hours_as_zero)",
+                    prefix,
+                    len(missing_starts),
+                    day.isoformat(),
+                )
+                continue
+
             day_starts = [
                 start_utc
                 for start_utc in measurements_by_start
@@ -1391,7 +1768,7 @@ class OctopusConsumptionStatisticsImporter:
 
         range_start = self._local_day_start_utc(range_start_day)
         range_end = self._local_day_start_utc(complete_until + timedelta(days=1))
-        daily_rows = await self._coordinator.async_fetch_daily_consumption(
+        daily_rows = await self._fetch_daily(
             self._account,
             range_start,
             range_end,
@@ -1458,9 +1835,9 @@ class OctopusConsumptionStatisticsImporter:
         return filled
 
     async def _async_process_update(self) -> None:
-        prefix = f"OctopusConsumptionStats[{self._account}]"
+        prefix = f"{self._log_label}[{self._account}]"
         try:
-            measurements_raw = self._coordinator.data[self._account].get("hourly_consumption", [])
+            measurements_raw = self._coordinator.data[self._account].get(self._seed_key, [])
             meas_count = len(measurements_raw) if isinstance(measurements_raw, list) else "unknown"
             _LOGGER.debug(
                 "%s: fetched hourly measurements count=%s type=%s",
@@ -1543,7 +1920,7 @@ class OctopusConsumptionStatisticsImporter:
             }
             _LOGGER.debug("%s: filled metadata statistics metadata=%s", prefix, metadata)
 
-            fetched = await self._coordinator.async_fetch_hourly_consumption(
+            fetched = await self._fetch_hourly(
                 self._account,
                 import_start_utc,
                 import_end_utc,
@@ -1644,6 +2021,18 @@ class OctopusConsumptionStatisticsImporter:
                         continue
                     preserved_existing_values_by_start[start_utc] = value
 
+            zero_filled_hours = 0
+            if self._fill_missing_hours_as_zero and api_measurements_by_start:
+                # Fill confirmed zero hours before truncation so days whose
+                # gaps are legitimate (no production) are not discarded.
+                zero_filled_hours = await self._async_fill_confirmed_zero_hours(
+                    prefix=prefix,
+                    measurements_by_start=api_measurements_by_start,
+                    import_start_utc=import_start_utc,
+                    today_local=dt_util.as_local(now_utc).date(),
+                )
+                api_measurement_starts.update(api_measurements_by_start)
+
             api_measurements_by_start, truncated_from_day = self._truncate_incomplete_days(
                 prefix=prefix,
                 measurements_by_start=api_measurements_by_start,
@@ -1723,8 +2112,6 @@ class OctopusConsumptionStatisticsImporter:
                     prefix,
                 )
                 return
-
-            zero_filled_hours = 0
 
             # Diagnostic-only comparison to help identify discrepancies with official app totals.
             await self._async_compare_hourly_vs_daily(

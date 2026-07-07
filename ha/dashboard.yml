@@ -1,42 +1,155 @@
+# Panel de ejemplo para Octopus Spain Fork.
+#
+# Nota sobre los entity_id: Home Assistant los genera a partir del nombre de la
+# entidad, que incluye tu número de cuenta entre paréntesis, p. ej.
+# "Tarifa (A-12345678)" -> sensor.tarifa_a_12345678. Sustituye el sufijo
+# `_a_12345678` de este ejemplo por el de tu cuenta (o elimínalo si tus
+# entidades antiguas no lo llevan). Comprueba los nombres reales en
+# Herramientas para desarrolladores -> Estados.
 views:
   - type: sections
-    sections:
-      - type: grid
-        cards:
-          - type: tile
-            entity: sensor.ultima_factura_octopus
-          - type: tile
-            entity: sensor.factura_impuestos
-          - type: tile
-            entity: sensor.factura_emitida
-          - type: tile
-            entity: sensor.factura_id
-          - type: tile
-            entity: sensor.factura_importe_facturado
-          - type: tile
-            entity: sensor.factura_impuestos
-          - type: tile
-            entity: sensor.factura_inicio_cargos
-          - type: markdown
-            content: |-
-              <h3>
-              <a href="{{ state_attr('sensor.factura_pdf', 'url') }}">
-              <ha-icon icon="mdi:file-pdf-box"></ha-icon>Factura: Pdf
-              </a>
-              </h3>
-            grid_options:
-              columns: 5
-              rows: 1.1
-          - type: tile
-            entity: sensor.factura_total_bruto
-          - type: tile
-            entity: sensor.factura_total_neto
-        column_span: 2
+    title: Octopus
     max_columns: 4
-    title: Main
-    cards: []
     header:
       card:
         type: markdown
         text_only: true
-        content: '# Hello {{ user }}'
+        content: "# Hola {{ user }}"
+    sections:
+      - type: grid
+        column_span: 2
+        cards:
+          - type: heading
+            heading: Última factura
+            icon: mdi:receipt-text
+          - type: tile
+            entity: sensor.ultima_factura_octopus_a_12345678
+            vertical: false
+            features_position: bottom
+          - type: tile
+            entity: sensor.factura_a_12345678_importe_facturado
+            vertical: false
+            features_position: bottom
+          - type: tile
+            entity: sensor.factura_a_12345678_total_bruto
+            vertical: false
+            features_position: bottom
+          - type: tile
+            entity: sensor.factura_a_12345678_total_neto
+            vertical: false
+            features_position: bottom
+          - type: tile
+            entity: sensor.factura_a_12345678_impuestos
+            vertical: false
+            features_position: bottom
+          - type: tile
+            entity: sensor.factura_a_12345678_emitida
+            vertical: false
+            features_position: bottom
+          - type: tile
+            entity: sensor.factura_a_12345678_inicio_cargos
+            vertical: false
+            features_position: bottom
+          - type: tile
+            entity: sensor.factura_a_12345678_id
+            vertical: false
+            features_position: bottom
+          - type: markdown
+            grid_options:
+              columns: 6
+              rows: 1.1
+            content: >-
+              <h3>
+
+              <a target="_blank" href="{{
+              state_attr('sensor.factura_a_12345678_pdf', 'local_url')
+                          or state_attr('sensor.factura_a_12345678_pdf', 'url') }}">
+              <ha-icon icon="mdi:file-pdf-box"></ha-icon> Factura: PDF
+
+              {{ '(local)' if state_attr('sensor.factura_a_12345678_pdf',
+              'local_url') else '(remota)' }}
+
+              </a>
+
+              </h3>
+          - type: button
+            name: Descargar PDF
+            icon: mdi:download
+            grid_options:
+              columns: 6
+              rows: 1.1
+            tap_action:
+              action: perform-action
+              perform_action: octopus_spain_fork.download_invoice
+      - type: grid
+        column_span: 2
+        cards:
+          - type: heading
+            heading: Contrato y tarifa
+            icon: mdi:tag-text
+          - type: tile
+            entity: sensor.tarifa_a_12345678
+            name: Tarifa
+            vertical: false
+            features_position: bottom
+          - type: tile
+            entity: sensor.precio_energia_a_12345678
+            name: Precio energía
+          - type: tile
+            entity: sensor.precio_potencia_a_12345678
+            name: Precio potencia
+          - type: tile
+            entity: sensor.precio_excedentes_a_12345678
+            name: Excedentes
+          - type: tile
+            entity: sensor.potencia_contratada_a_12345678
+            name: Potencia contratada
+          - type: tile
+            entity: sensor.cups_a_12345678
+            name: CUPS
+      - type: grid
+        column_span: 2
+        cards:
+          - type: heading
+            heading: Facturación y saldos
+            icon: mdi:cash-multiple
+          - type: tile
+            entity: sensor.proxima_facturacion_a_12345678
+            name: Próxima facturación
+          - type: tile
+            entity: sensor.proximo_pago_a_12345678
+            name: Próximo pago
+          - type: tile
+            entity: sensor.solar_wallet_a_12345678
+            name: Solar Wallet
+            vertical: false
+            features_position: bottom
+          - type: tile
+            entity: sensor.octopus_credit_a_12345678
+            name: Crédito Octopus
+            vertical: false
+            features_position: bottom
+      - type: grid
+        column_span: 2
+        cards:
+          - type: heading
+            heading: Energía (este mes)
+            icon: mdi:lightning-bolt
+          - type: statistics-graph
+            title: Consumo eléctrico
+            chart_type: bar
+            period: day
+            days_to_show: 31
+            stat_types:
+              - change
+            entities:
+              - octopus_spain_fork:energy_consumption_a_12345678
+          - type: statistics-graph
+            title: Excedente solar
+            chart_type: bar
+            period: day
+            days_to_show: 31
+            stat_types:
+              - change
+            entities:
+              - octopus_spain_fork:energy_export_a_12345678
