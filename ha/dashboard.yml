@@ -46,7 +46,7 @@ views:
               rows: 1.1
             content: |-
               <h3>
-              <a href="{{ state_attr('sensor.factura_pdf', 'local_url')
+              <a target="_blank" href="{{ state_attr('sensor.factura_pdf', 'local_url')
                           or state_attr('sensor.factura_pdf', 'url') }}">
               <ha-icon icon="mdi:file-pdf-box"></ha-icon> Factura: PDF
               {{ '(local)' if state_attr('sensor.factura_pdf', 'local_url') else '(remota)' }}
