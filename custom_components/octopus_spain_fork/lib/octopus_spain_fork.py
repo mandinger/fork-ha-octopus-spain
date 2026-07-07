@@ -46,6 +46,14 @@ def _empty_account_payload(
     }
 
 
+def cents_to_eur(value) -> Optional[float]:
+    """Convert an API monetary value in cents to euros."""
+    try:
+        return float(value) / 100 if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _to_local_date_str(iso_str: Optional[str]) -> Optional[str]:
     """Parse an ISO8601 datetime string and return local date (YYYY-MM-DD).
 
@@ -424,14 +432,6 @@ class OctopusSpain:
                   isFixed
                   periodStartDay
                 }
-                paginatedPaymentForecast(first: 1) {
-                  edges {
-                    node {
-                      amount
-                      date
-                    }
-                  }
-                }
                 ledgers {
                   ledgerType
                   balance
@@ -458,32 +458,33 @@ class OctopusSpain:
         headers = {"authorization": self._token}
         client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
         response = await client.execute_async(query, {"account": account})
-        if not isinstance(response, dict) or "errors" in response:
+        if not isinstance(response, dict):
+            _LOGGER.error(
+                "Failed to fetch billing info for account %s: no response from API",
+                account,
+            )
+            return _empty_account_payload()
+
+        # Field-level GraphQL errors come with partial data alongside them;
+        # only give up when there is no usable account payload at all. The
+        # API can also return {"data": null} or {"data": {"account": null}}
+        # without an "errors" key; chained .get(..., {}) does not protect
+        # against explicit nulls (see issue #29).
+        errors = response.get("errors")
+        account_data = (response.get("data") or {}).get("account") or {}
+        if not account_data:
             _LOGGER.error(
                 "Failed to fetch billing info for account %s: %s",
                 account,
-                response.get("errors") if isinstance(response, dict) else "no response from API",
+                errors or "null data",
             )
             return _empty_account_payload()
-
-        # The API can return {"data": null} or {"data": {"account": null}}
-        # without an "errors" key; chained .get(..., {}) does not protect
-        # against explicit nulls (see issue #29).
-        data = response.get("data")
-        account_data = (data or {}).get("account") or {}
-        if not account_data:
-            _LOGGER.error(
-                "Billing info response contained no account data for account %s: %s",
+        if errors:
+            _LOGGER.debug(
+                "Partial GraphQL errors fetching billing info for account %s (continuing with partial data): %s",
                 account,
-                response.get("errors") or "null data",
+                errors,
             )
-            return _empty_account_payload()
-
-        def cents_to_eur(value):
-            try:
-                return float(value) / 100 if value is not None else None
-            except (TypeError, ValueError):
-                return None
 
         billing_options = account_data.get("billingOptions") or {}
         billing = {
@@ -494,12 +495,9 @@ class OctopusSpain:
             "period_start_day": billing_options.get("periodStartDay"),
         } if billing_options else None
 
-        forecast_edges = (account_data.get("paginatedPaymentForecast") or {}).get("edges") or []
-        forecast_node = (forecast_edges[0] or {}).get("node") if forecast_edges else None
-        payment_forecast = {
-            "amount": cents_to_eur(forecast_node.get("amount")),
-            "date": forecast_node.get("date"),
-        } if isinstance(forecast_node, dict) else None
+        # Fetched separately: the field errors (KT-CT-3949) on accounts
+        # without forecastable payments and must not poison billing data.
+        payment_forecast = await self.payment_forecast(account)
 
         ledgers = account_data.get("ledgers") or []
         if not isinstance(ledgers, list):
@@ -588,6 +586,77 @@ class OctopusSpain:
             },
         }
 
+    async def payment_forecast(self, account: str) -> Optional[dict]:
+        """Fetch the next forecasted payment for the account.
+
+        Kept out of the main billing query on purpose: Kraken raises
+        KT-CT-3949 for accounts without forecastable payments, and a
+        field-level error here must never affect billing data.
+        Returns {"amount": eur, "date": str} or None.
+        """
+        if self._token is None:
+            if not await self.login():
+                _LOGGER.warning(
+                    "Unable to fetch payment forecast for account %s due to login failure",
+                    account,
+                )
+                return None
+
+        query = """
+            query getPaymentForecast($account: String!) {
+              account(accountNumber: $account) {
+                paginatedPaymentForecast(first: 1) {
+                  edges {
+                    node {
+                      amount
+                      date
+                    }
+                  }
+                }
+              }
+            }
+        """
+        headers = {"authorization": self._token}
+        client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
+        response = await client.execute_async(query, {"account": account})
+        if not isinstance(response, dict):
+            _LOGGER.warning(
+                "Failed to fetch payment forecast for account %s: no response from API",
+                account,
+            )
+            return None
+
+        errors = response.get("errors") or []
+        if errors:
+            error_codes = {
+                (error.get("extensions") or {}).get("errorCode")
+                for error in errors
+                if isinstance(error, dict)
+            }
+            if error_codes == {"KT-CT-3949"}:
+                # Expected for accounts where forecasts are unavailable.
+                _LOGGER.debug(
+                    "Payment forecast unavailable for account %s (KT-CT-3949)",
+                    account,
+                )
+            else:
+                _LOGGER.warning(
+                    "Failed to fetch payment forecast for account %s: %s",
+                    account,
+                    errors,
+                )
+            return None
+
+        account_data = (response.get("data") or {}).get("account") or {}
+        forecast_edges = (account_data.get("paginatedPaymentForecast") or {}).get("edges") or []
+        forecast_node = (forecast_edges[0] or {}).get("node") if forecast_edges else None
+        if not isinstance(forecast_node, dict):
+            return None
+        return {
+            "amount": cents_to_eur(forecast_node.get("amount")),
+            "date": forecast_node.get("date"),
+        }
+
     async def supply_points(self, account: str) -> Optional[dict]:
         """Fetch contract/tariff details for the account's electricity supply point.
 
@@ -645,15 +714,29 @@ class OctopusSpain:
         headers = {"authorization": self._token}
         client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
         response = await client.execute_async(query, {"account": account})
-        if not isinstance(response, dict) or "errors" in response:
+        if not isinstance(response, dict):
             _LOGGER.warning(
-                "Failed to fetch supply points for account %s: %s",
+                "Failed to fetch supply points for account %s: no response from API",
                 account,
-                response.get("errors") if isinstance(response, dict) else "no response from API",
             )
             return None
 
+        errors = response.get("errors")
         account_data = (response.get("data") or {}).get("account") or {}
+        if not account_data:
+            _LOGGER.warning(
+                "Failed to fetch supply points for account %s: %s",
+                account,
+                errors or "null data",
+            )
+            return None
+        if errors:
+            _LOGGER.debug(
+                "Partial GraphQL errors fetching supply points for account %s (continuing with partial data): %s",
+                account,
+                errors,
+            )
+
         properties = account_data.get("properties") or []
         supply_point = None
         for prop in properties:
