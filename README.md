@@ -155,3 +155,11 @@ explícita en el momento en que se creó este fork.
 Por ese motivo, la licencia MIT de este repositorio se aplica únicamente a las contribuciones, cambios y código nuevo
 añadidos en este fork por sus autores. No pretende relicenciar el código preexistente del proyecto original ni conceder
 derechos sobre partes cuyo copyright pertenezca a terceros.
+
+## 💜 Apoya el proyecto
+
+Si te está gustando la integración y todavía no eres cliente de Octopus Energy, ¿por qué no usar mi enlace de referido al darte de alta?
+
+👉 [https://share.octopusenergy.es/subtle-prize-761](https://share.octopusenergy.es/subtle-prize-761)
+
+*If you are enjoying the integration, why not use my referral link if you're not already a part of Octopus Energy?*
