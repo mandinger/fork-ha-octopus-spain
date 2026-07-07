@@ -10,8 +10,27 @@ from homeassistant.util import dt as dt_util
 GRAPH_QL_ENDPOINT = "https://api.oees-kraken.energy/v1/graphql/"
 SOLAR_WALLET_LEDGER = "SOLAR_WALLET_LEDGER"
 ELECTRICITY_LEDGER = "SPAIN_ELECTRICITY_LEDGER"
+# Page size for the paginated measurements query. Large windows paginate via
+# pageInfo.endCursor instead of silently truncating at the first page.
+MEASUREMENTS_PAGE = 1500
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class OctopusApiError(Exception):
+    """Error returned by the Octopus GraphQL API (a response with no usable data)."""
+
+
+def _error_message(response: Any) -> str:
+    """Summarize the errors of a GraphQL response for exceptions/logs."""
+    if not isinstance(response, dict):
+        return "Octopus API returned no response"
+    errors = response.get("errors") or []
+    if errors:
+        return "; ".join(
+            error.get("message", "") for error in errors if isinstance(error, dict)
+        )
+    return "Octopus API returned no data"
 
 
 def _empty_account_payload(
@@ -249,6 +268,8 @@ class OctopusSpain:
                 $account: String!,
                 $startAt: DateTime!,
                 $endAt: DateTime!,
+                $first: Int!,
+                $after: String,
                 $utilityFilters: [UtilityFiltersInput!],
                 $timezone: String
                 ) {
@@ -256,12 +277,17 @@ class OctopusSpain:
                     properties {
                     id
                     measurements(
-                        first: 1500,
+                        first: $first,
+                        after: $after,
                         utilityFilters: $utilityFilters,
                         startAt: $startAt,
                         endAt: $endAt,
                         timezone: $timezone
                     ) {
+                        pageInfo {
+                        hasNextPage
+                        endCursor
+                        }
                         edges {
                         node {
                             value
@@ -323,6 +349,8 @@ class OctopusSpain:
             "account": account,
             "startAt": to_utc_iso_z(start_utc),
             "endAt": to_utc_iso_z(end_utc),
+            "first": MEASUREMENTS_PAGE,
+            "after": None,
             "timezone": api_timezone,
             "utilityFilters": [
                 {
@@ -335,69 +363,93 @@ class OctopusSpain:
         }
         headers = {"authorization": self._token}
         client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
-        response = await client.execute_async(query, variables)
-        if "errors" in response:
-            _LOGGER.error(
-                "GraphQL errors while fetching %s %s for account %s: %s",
-                reading_frequency_type.lower(),
-                reading_direction.lower(),
-                account,
-                response["errors"],
+
+        results: list[dict] = []
+        while True:
+            response = await client.execute_async(query, variables)
+            if not isinstance(response, dict):
+                raise OctopusApiError(
+                    f"No response fetching {reading_frequency_type.lower()} "
+                    f"{reading_direction.lower()} for account {account}"
+                )
+
+            # Field-level errors can come alongside usable partial data; only
+            # fail when there is no account payload at all. The API can also
+            # return {"data": null} without an "errors" key (issue #29).
+            errors = response.get("errors")
+            account_data = (response.get("data") or {}).get("account") or {}
+            if not account_data:
+                raise OctopusApiError(_error_message(response))
+            if errors:
+                _LOGGER.debug(
+                    "Partial GraphQL errors fetching %s %s for account %s (continuing with partial data): %s",
+                    reading_frequency_type.lower(),
+                    reading_direction.lower(),
+                    account,
+                    errors,
+                )
+
+            props = account_data.get("properties") or []
+            if not props:
+                _LOGGER.warning(
+                    "No properties returned in %s consumption response for account %s",
+                    reading_frequency_type.lower(),
+                    account,
+                )
+                return results
+            try:
+                connection = props[0]["measurements"]
+                edges = connection["edges"]
+            except (KeyError, IndexError, TypeError) as err:
+                _LOGGER.error(
+                    "Unexpected %s consumption response format for account %s: %s",
+                    reading_frequency_type.lower(),
+                    account,
+                    err,
+                )
+                _LOGGER.debug(
+                    "%s consumption raw response for account %s: %s",
+                    reading_frequency_type,
+                    account,
+                    response,
+                )
+                return results
+
+            results.extend(
+                {
+                    "value": edge["node"]["value"],
+                    "unit": edge["node"]["unit"],
+                    "startAt": edge["node"].get("startAt"),
+                    "endAt": edge["node"].get("endAt"),
+                }
+                for edge in edges
             )
-            return []
+
+            page_info = connection.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            variables["after"] = page_info.get("endCursor")
+            if not variables["after"]:
+                break
 
         _LOGGER.debug(
-            "%s %s query for account %s executed. Start=%s End=%s Timezone=%s",
+            "%s %s query for account %s executed. Start=%s End=%s Timezone=%s Rows=%s",
             reading_frequency_type,
             reading_direction,
             account,
             variables["startAt"],
             variables["endAt"],
             api_timezone,
+            len(results),
         )
 
-        props = response.get("data", {}).get("account", {}).get("properties", [])
-        if not props:
-            _LOGGER.warning(
-                "No properties returned in %s consumption response for account %s",
-                reading_frequency_type.lower(),
-                account,
-            )
-            return []
-        try:
-            edges = props[0]["measurements"]["edges"]
-        except (KeyError, IndexError, TypeError) as err:
-            _LOGGER.error(
-                "Unexpected %s consumption response format for account %s: %s",
-                reading_frequency_type.lower(),
-                account,
-                err,
-            )
-            _LOGGER.debug(
-                "%s consumption raw response for account %s: %s",
-                reading_frequency_type,
-                account,
-                response,
-            )
-            return []
-
-        if not edges:
+        if not results:
             _LOGGER.debug(
                 "%s consumption response returned 0 measurements for account %s",
                 reading_frequency_type,
                 account,
             )
-            return []
-
-        return [
-            {
-                "value": edge["node"]["value"],
-                "unit": edge["node"]["unit"],
-                "startAt": edge["node"].get("startAt"),
-                "endAt": edge["node"].get("endAt"),
-            }
-            for edge in edges
-        ]
+        return results
 
     @staticmethod
     def _api_timezone_name() -> str:
