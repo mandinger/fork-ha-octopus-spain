@@ -93,6 +93,22 @@ views:
             vertical: false
             features_position: bottom
           - type: tile
+            entity: sensor.precio_actual_a_12345678
+            name: Precio actual
+            state_content:
+              - state
+              - period
+            color: primary
+          - type: tile
+            entity: sensor.precio_punta_a_12345678
+            name: Punta (P1)
+          - type: tile
+            entity: sensor.precio_llano_a_12345678
+            name: Llano (P2)
+          - type: tile
+            entity: sensor.precio_valle_a_12345678
+            name: Valle (P3)
+          - type: tile
             entity: sensor.precio_energia_a_12345678
             name: Precio energía
           - type: tile
@@ -135,6 +151,12 @@ views:
           - type: heading
             heading: Energía (este mes)
             icon: mdi:lightning-bolt
+          - type: tile
+            entity: sensor.consumo_ultimo_dia_a_12345678
+            name: Consumo último día
+            state_content:
+              - state
+              - Fecha
           - type: statistics-graph
             title: Consumo eléctrico
             chart_type: bar
