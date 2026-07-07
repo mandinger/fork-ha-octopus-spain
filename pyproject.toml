@@ -1,0 +1,90 @@
+[project]
+name = "fork-ha-octopus-spain"
+version = "0.0.0"
+description = "Componente para Home Assistant con los datos de consumo y facturación de Octopus Energy España (fork de Mandinger)"
+authors = [
+    { name = "Mandinger" }
+]
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.13.2"
+dependencies = [
+    "homeassistant>=2025.10.0",
+    "python-graphql-client==0.4.3",
+    "tariff-td==1.1",
+    "voluptuous>=0.15.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/mandinger/fork-ha-octopus-spain"
+Issues = "https://github.com/mandinger/fork-ha-octopus-spain/issues"
+Repository = "https://github.com/mandinger/fork-ha-octopus-spain"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 140
+src = ["custom_components/octopus_spain_fork"]
+
+[tool.ruff.lint]
+ignore = [
+  "A005", # It is just wrong
+  "ANN401", # Opiniated warning on disallowing dynamically typed expressions
+  "D203", # Conflicts with other rules
+  "D213", # Conflicts with other rules
+  "RUF012", # Just broken
+  "TID252", # Relative imports
+
+  # Formatter conflicts
+  "COM812",
+  "COM819",
+  "D206",
+  "E501",
+  "ISC001",
+  "Q000",
+  "Q001",
+  "Q002",
+  "Q003",
+  "W191",
+]
+
+[tool.ruff.lint.flake8-import-conventions.extend-aliases]
+"homeassistant.helpers.area_registry" = "ar"
+"homeassistant.helpers.config_validation" = "cv"
+"homeassistant.helpers.device_registry" = "dr"
+"homeassistant.helpers.entity_registry" = "er"
+"homeassistant.helpers.issue_registry" = "ir"
+voluptuous = "vol"
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+known-first-party = [
+    "homeassistant",
+]
+combine-as-imports = true
+
+[tool.pylint.MAIN]
+init-hook = "import sys; sys.path.append('custom_components')"
+
+[tool.pylint.'MESSAGES CONTROL']
+max-line-length = 140
+
+[tool.hatch.build.targets.wheel]
+packages = ["custom_components/octopus_spain_fork"]
+
+[dependency-groups]
+dev = [
+    "pylint>=3.1.0",
+    "ruff>=0.3.2",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "pytest-homeassistant-custom-component>=0.13.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

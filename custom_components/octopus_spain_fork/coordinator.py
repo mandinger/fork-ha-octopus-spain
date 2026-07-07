@@ -10,7 +10,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import CONSUMPTION_IMPORT_DELAY_DAYS, UPDATE_INTERVAL
 from .invoice_pdf import InvoicePdfManager
-from .lib.octopus_spain_fork import OctopusSpain
+from .lib.octopus_spain_fork import OctopusApiError, OctopusSpain
 
 _LOGGER = logging.getLogger(__name__)
 PDF_REFRESH_BUFFER = timedelta(minutes=5)
@@ -91,11 +91,47 @@ class OctopusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         while day_cursor < end_day:
             day_start = datetime.combine(day_cursor, time.min, dt_util.UTC)
             day_end = day_start + timedelta(days=1)
-            fetched = await fetcher(account, start=day_start, end=day_end)
+            try:
+                fetched = await fetcher(account, start=day_start, end=day_end)
+            except OctopusApiError as err:
+                _LOGGER.warning(
+                    "Seed fetch failed for account %s (%s..%s): %s",
+                    account,
+                    day_start,
+                    day_end,
+                    err,
+                )
+                fetched = []
             if fetched:
                 measurements.extend(fetched)
             day_cursor += timedelta(days=1)
         return measurements
+
+    async def _async_fetch_measurements(
+        self,
+        fetcher,
+        label: str,
+        account: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[dict[str, Any]]:
+        """Run a lib fetcher, mapping API failures to an empty result.
+
+        Callers (the statistics importer) treat "no rows" as "retry next
+        cycle", so a typed OctopusApiError must not propagate past here.
+        """
+        try:
+            return await fetcher(account, start=start, end=end)
+        except OctopusApiError as err:
+            _LOGGER.warning(
+                "%s fetch failed for account %s (%s..%s): %s",
+                label,
+                account,
+                start,
+                end,
+                err,
+            )
+            return []
 
     async def _async_attach_local_pdf(self, account: str, acc: dict[str, Any]) -> None:
         """Store the invoice PDF locally and expose its durable path/URL."""
@@ -113,7 +149,9 @@ class OctopusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         end: datetime,
     ) -> list[dict[str, Any]]:
         """Fetch hourly consumption for a specific range."""
-        return await self._api.hourly_consumption(account, start=start, end=end)
+        return await self._async_fetch_measurements(
+            self._api.hourly_consumption, "Hourly consumption", account, start, end
+        )
 
     async def async_fetch_daily_consumption(
         self,
@@ -122,7 +160,9 @@ class OctopusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         end: datetime,
     ) -> list[dict[str, Any]]:
         """Fetch daily consumption for a specific range."""
-        return await self._api.daily_consumption(account, start=start, end=end)
+        return await self._async_fetch_measurements(
+            self._api.daily_consumption, "Daily consumption", account, start, end
+        )
 
     async def async_fetch_hourly_generation(
         self,
@@ -131,7 +171,9 @@ class OctopusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         end: datetime,
     ) -> list[dict[str, Any]]:
         """Fetch hourly solar generation (export) for a specific range."""
-        return await self._api.hourly_generation(account, start=start, end=end)
+        return await self._async_fetch_measurements(
+            self._api.hourly_generation, "Hourly generation", account, start, end
+        )
 
     async def async_fetch_daily_generation(
         self,
@@ -140,7 +182,9 @@ class OctopusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         end: datetime,
     ) -> list[dict[str, Any]]:
         """Fetch daily solar generation (export) for a specific range."""
-        return await self._api.daily_generation(account, start=start, end=end)
+        return await self._async_fetch_measurements(
+            self._api.daily_generation, "Daily generation", account, start, end
+        )
 
     async def async_refresh_account_invoice(self, account: str) -> bool:
         """Refresh billing data for a single account without reloading consumption."""

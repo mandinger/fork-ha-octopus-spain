@@ -1,0 +1,31 @@
+---
+name: Pylint
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  DEFAULT_PYTHON: "3.13"
+
+jobs:
+  pylint:
+    name: Pylint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: ${{ env.DEFAULT_PYTHON }}
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      # Errors only: the legacy modules predate pylint in this repo and full
+      # message coverage would make the check permanently red.
+      - name: Run pylint (errors only)
+        run: uv run pylint --disable=all --enable=E custom_components/octopus_spain_fork
