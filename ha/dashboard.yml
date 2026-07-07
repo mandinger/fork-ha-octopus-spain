@@ -14,7 +14,7 @@ views:
       card:
         type: markdown
         text_only: true
-        content: '# Hola {{ user }}'
+        content: "# Hola {{ user }}"
     sections:
       - type: grid
         column_span: 2
@@ -23,34 +23,54 @@ views:
             heading: Última factura
             icon: mdi:receipt-text
           - type: tile
-            entity: sensor.ultima_factura_octopus
+            entity: sensor.ultima_factura_octopus_a_12345678
+            vertical: false
+            features_position: bottom
           - type: tile
-            entity: sensor.factura_importe_facturado
+            entity: sensor.factura_a_12345678_importe_facturado
+            vertical: false
+            features_position: bottom
           - type: tile
-            entity: sensor.factura_total_bruto
+            entity: sensor.factura_a_12345678_total_bruto
+            vertical: false
+            features_position: bottom
           - type: tile
-            entity: sensor.factura_total_neto
+            entity: sensor.factura_a_12345678_total_neto
+            vertical: false
+            features_position: bottom
           - type: tile
-            entity: sensor.factura_impuestos
+            entity: sensor.factura_a_12345678_impuestos
+            vertical: false
+            features_position: bottom
           - type: tile
-            entity: sensor.factura_emitida
+            entity: sensor.factura_a_12345678_emitida
+            vertical: false
+            features_position: bottom
           - type: tile
-            entity: sensor.factura_inicio_cargos
+            entity: sensor.factura_a_12345678_inicio_cargos
+            vertical: false
+            features_position: bottom
           - type: tile
-            entity: sensor.factura_id
-          # Enlace permanente a la copia local del PDF (no caduca). Si aún no
-          # se ha descargado, cae a la URL remota firmada.
+            entity: sensor.factura_a_12345678_id
+            vertical: false
+            features_position: bottom
           - type: markdown
             grid_options:
               columns: 6
               rows: 1.1
-            content: |-
+            content: >-
               <h3>
-              <a target="_blank" href="{{ state_attr('sensor.factura_pdf', 'local_url')
-                          or state_attr('sensor.factura_pdf', 'url') }}">
+
+              <a target="_blank" href="{{
+              state_attr('sensor.factura_a_12345678_pdf', 'local_url')
+                          or state_attr('sensor.factura_a_12345678_pdf', 'url') }}">
               <ha-icon icon="mdi:file-pdf-box"></ha-icon> Factura: PDF
-              {{ '(local)' if state_attr('sensor.factura_pdf', 'local_url') else '(remota)' }}
+
+              {{ '(local)' if state_attr('sensor.factura_a_12345678_pdf',
+              'local_url') else '(remota)' }}
+
               </a>
+
               </h3>
           - type: button
             name: Descargar PDF
@@ -61,7 +81,6 @@ views:
             tap_action:
               action: perform-action
               perform_action: octopus_spain_fork.download_invoice
-
       - type: grid
         column_span: 2
         cards:
@@ -71,13 +90,14 @@ views:
           - type: tile
             entity: sensor.tarifa_a_12345678
             name: Tarifa
+            vertical: false
+            features_position: bottom
           - type: tile
             entity: sensor.precio_energia_a_12345678
             name: Precio energía
           - type: tile
             entity: sensor.precio_potencia_a_12345678
             name: Precio potencia
-          # Solo existe en contratos con compensación de excedentes:
           - type: tile
             entity: sensor.precio_excedentes_a_12345678
             name: Excedentes
@@ -87,7 +107,6 @@ views:
           - type: tile
             entity: sensor.cups_a_12345678
             name: CUPS
-
       - type: grid
         column_span: 2
         cards:
@@ -101,12 +120,15 @@ views:
             entity: sensor.proximo_pago_a_12345678
             name: Próximo pago
           - type: tile
-            entity: sensor.solar_wallet
+            entity: sensor.solar_wallet_a_12345678
             name: Solar Wallet
+            vertical: false
+            features_position: bottom
           - type: tile
-            entity: sensor.octopus_credit
+            entity: sensor.octopus_credit_a_12345678
             name: Crédito Octopus
-
+            vertical: false
+            features_position: bottom
       - type: grid
         column_span: 2
         cards:
@@ -122,7 +144,6 @@ views:
               - change
             entities:
               - octopus_spain_fork:energy_consumption_a_12345678
-          # Solo para cuentas con Solar Wallet:
           - type: statistics-graph
             title: Excedente solar
             chart_type: bar
