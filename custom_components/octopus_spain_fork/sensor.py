@@ -21,7 +21,11 @@ try:
 except ImportError:  # pragma: no cover - older Home Assistant versions
     MATCH_ALL = None
 from homeassistant.core import HomeAssistant, callback, valid_entity_id
-from homeassistant.helpers.event import async_track_point_in_utc_time
+from homeassistant.helpers.event import (
+    async_track_point_in_utc_time,
+    async_track_time_change,
+)
+from tariff_td import Tariff20TD
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import StateType
@@ -46,7 +50,13 @@ try:
     from homeassistant.components.recorder.statistics import async_update_statistics_metadata
 except ImportError:  # pragma: no cover - older Home Assistant versions
     async_update_statistics_metadata = None
-from .const import CONSUMPTION_IMPORT_DELAY_DAYS, DOMAIN, STAT_PREFIX_EXPORT
+from .const import (
+    CONSUMPTION_IMPORT_DELAY_DAYS,
+    DOMAIN,
+    STAT_PREFIX_EXPORT,
+    STATISTICS_BACKFILL_CHUNK_DAYS,
+    STATISTICS_BACKFILL_DAYS,
+)
 from .coordinator import OctopusCoordinator
 from .runtime import OctopusSpainConfigEntry
 
@@ -285,6 +295,13 @@ async def async_setup_entry(
         sensors.extend(
             _contract_sensors(account, coordinator, account_data.get("contract"))
         )
+
+        # Current 2.0TD-period price; only when the tariff has P1/P2/P3 prices.
+        if _tariff_period_prices(account_data.get("contract")):
+            sensors.append(OctopusCurrentPrice(account, coordinator))
+
+        # kWh total of the most recent day with hourly data.
+        sensors.append(OctopusLastDayConsumption(account, coordinator))
 
         # Billing cycle and payment forecast
         sensors.extend(_billing_sensors(account, coordinator))
@@ -745,6 +762,75 @@ def _second(values: Any) -> float | None:
     return None
 
 
+def _nth(values: Any, index: int) -> float | None:
+    """Return the n-th element of a list-like price/power array."""
+    if isinstance(values, (list, tuple)) and len(values) > index:
+        return values[index]
+    return None
+
+
+# 2.0TD access-tariff periods in the order Kraken returns price arrays.
+TARIFF_PERIOD_INDEX = {"P1": 0, "P2": 1, "P3": 2}
+TARIFF_PERIOD_NAMES = [("P1", "Punta"), ("P2", "Llano"), ("P3", "Valle")]
+
+
+def _last_day_consumption(rows: Any) -> tuple[float, date] | None:
+    """Total kWh of the most recent local day present in hourly measurement rows.
+
+    Rows are the lib's measurement dicts ({value, unit, startAt, endAt}).
+    Returns (total_kwh, day) or None when nothing is parseable.
+    """
+    if not isinstance(rows, list):
+        return None
+    totals_by_day: dict[date, float] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        start_at = row.get("startAt")
+        if not isinstance(start_at, str):
+            continue
+        parsed = dt_util.parse_datetime(start_at)
+        if parsed is None:
+            continue
+        try:
+            value = float(row.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if value < 0:
+            continue
+        day = dt_util.as_local(dt_util.as_utc(parsed)).date()
+        totals_by_day[day] = totals_by_day.get(day, 0.0) + value
+    if not totals_by_day:
+        return None
+    last_day = max(totals_by_day)
+    return round(totals_by_day[last_day], 3), last_day
+
+
+def _tariff_period_prices(contract: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Return the P1/P2/P3 price arrays from contract data, or None.
+
+    Prefers prices with taxes (what the user actually pays); falls back to the
+    plain variable term. Only 3-period (2.0TD) tariffs are supported.
+    """
+    if not isinstance(contract, Mapping):
+        return None
+    prices = contract.get("prices") or {}
+    with_taxes = prices.get("variable_term_with_taxes")
+    without_taxes = prices.get("variable_term")
+    if not (isinstance(with_taxes, (list, tuple)) and len(with_taxes) == 3):
+        with_taxes = None
+    if not (isinstance(without_taxes, (list, tuple)) and len(without_taxes) == 3):
+        without_taxes = None
+    effective = with_taxes if with_taxes is not None else without_taxes
+    if effective is None:
+        return None
+    return {
+        "effective": list(effective),
+        "with_taxes": list(with_taxes) if with_taxes is not None else None,
+        "without_taxes": list(without_taxes) if without_taxes is not None else None,
+    }
+
+
 def _contract_sensors(
     account: str, coordinator: OctopusCoordinator, contract: Mapping[str, Any] | None
 ) -> list[OctopusAccountFieldSensor]:
@@ -848,6 +934,34 @@ def _contract_sensors(
         ),
     ]
 
+    # Per-period price sensors (2.0TD): only when the tariff exposes the three
+    # P1/P2/P3 values, otherwise flat tariffs would get bogus entities.
+    if _tariff_period_prices(contract):
+        for period, period_name in TARIFF_PERIOD_NAMES:
+            index = TARIFF_PERIOD_INDEX[period]
+            sensors.append(
+                OctopusAccountFieldSensor(
+                    account,
+                    coordinator,
+                    source_key="contract",
+                    key=f"{period.lower()}_price",
+                    name=f"Precio {period_name}",
+                    icon="mdi:transmission-tower",
+                    unit=f"{CURRENCY_EURO}/kWh",
+                    state_class=SensorStateClass.MEASUREMENT,
+                    value_fn=lambda c, i=index: (
+                        _nth(prices(c).get("variable_term_with_taxes"), i)
+                        if _nth(prices(c).get("variable_term_with_taxes"), i) is not None
+                        else _nth(prices(c).get("variable_term"), i)
+                    ),
+                    attrs_fn=lambda c, i=index, p=period: {
+                        "period": p,
+                        "without_taxes": _nth(prices(c).get("variable_term"), i),
+                        "with_taxes": _nth(prices(c).get("variable_term_with_taxes"), i),
+                    },
+                )
+            )
+
     # Only surface a surplus price entity when the account can have one,
     # otherwise non-solar users get a permanently unknown sensor.
     has_surplus = bool(contract and (contract.get("prices") or {}).get("surplus_rate") is not None)
@@ -903,6 +1017,132 @@ def _billing_sensors(
             attrs_fn=lambda f: {"date": f.get("date")},
         ),
     ]
+
+
+class OctopusCurrentPrice(CoordinatorEntity[OctopusCoordinator], SensorEntity):
+    """Current energy price for the active 2.0TD period (punta/llano/valle).
+
+    Recomputed on every coordinator refresh and at the top of each hour, when
+    the access-tariff period can change.
+    """
+
+    def __init__(self, account: str, coordinator: OctopusCoordinator) -> None:
+        super().__init__(coordinator=coordinator)
+        self._account = account
+        self._state: StateType = None
+        self._attrs: Mapping[str, Any] = {}
+        safe_account = _account_slug(account)
+        self._attr_name = _account_name("Precio Actual", account)
+        self._attr_unique_id = f"current_price_{safe_account}"
+        self.entity_description = SensorEntityDescription(
+            key=self._attr_unique_id,
+            icon="mdi:transmission-tower-import",
+            native_unit_of_measurement=f"{CURRENCY_EURO}/kWh",
+            state_class=SensorStateClass.MEASUREMENT,
+        )
+
+    @property
+    def available(self) -> bool:
+        contract = (self.coordinator.data.get(self._account) or {}).get("contract")
+        return super().available and _tariff_period_prices(contract) is not None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        # Period changes happen on the hour; a small offset avoids racing it.
+        self.async_on_remove(
+            async_track_time_change(self.hass, self._tick, minute=0, second=10)
+        )
+        self._update()
+
+    @callback
+    def _tick(self, _now: datetime) -> None:
+        self._update()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._update()
+
+    def _update(self) -> None:
+        contract = (self.coordinator.data.get(self._account) or {}).get("contract")
+        period_prices = _tariff_period_prices(contract)
+        if period_prices is None:
+            self._state = None
+            self._attrs = {}
+            self.async_write_ha_state()
+            return
+
+        effective = period_prices["effective"]
+        tariff = Tariff20TD(p1=effective[0], p2=effective[1], p3=effective[2])
+        now = dt_util.now()
+        period = tariff.get_period(now)
+        index = TARIFF_PERIOD_INDEX.get(period)
+        self._state = tariff.get_price(now)
+        self._attrs = {
+            "period": period,
+            "without_taxes": (
+                _nth(period_prices["without_taxes"], index)
+                if index is not None
+                else None
+            ),
+            "prices_include_taxes": period_prices["with_taxes"] is not None,
+        }
+        self.async_write_ha_state()
+
+    @property
+    def native_value(self) -> StateType:
+        return self._state
+
+    @property
+    def extra_state_attributes(self) -> Mapping[str, Any] | None:
+        return self._attrs
+
+
+class OctopusLastDayConsumption(CoordinatorEntity[OctopusCoordinator], SensorEntity):
+    """Consumption (kWh) of the last day available in the seeded hourly data."""
+
+    def __init__(self, account: str, coordinator: OctopusCoordinator) -> None:
+        super().__init__(coordinator=coordinator)
+        self._account = account
+        self._state: StateType = None
+        self._attrs: Mapping[str, Any] = {}
+        safe_account = _account_slug(account)
+        self._attr_name = _account_name("Consumo Último Día", account)
+        self._attr_unique_id = f"last_day_consumption_{safe_account}"
+        self.entity_description = SensorEntityDescription(
+            key=self._attr_unique_id,
+            icon="mdi:transmission-tower-import",
+            native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            device_class=SensorDeviceClass.ENERGY,
+            state_class=SensorStateClass.TOTAL,
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._update_value()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._update_value()
+        self.async_write_ha_state()
+
+    def _update_value(self) -> None:
+        rows = (self.coordinator.data.get(self._account) or {}).get("hourly_consumption")
+        result = _last_day_consumption(rows)
+        if result is None:
+            self._state = None
+            self._attrs = {}
+            return
+        total, day = result
+        self._state = total
+        self._attrs = {"Fecha": day.isoformat()}
+
+    @property
+    def native_value(self) -> StateType:
+        return self._state
+
+    @property
+    def extra_state_attributes(self) -> Mapping[str, Any] | None:
+        return self._attrs
 
 
 class OctopusConsumptionStatisticsSensor(
@@ -1065,6 +1305,7 @@ class OctopusConsumptionStatisticsImporter:
         self._log_label = log_label
         self._remove_listener: Callable[[], None] | None = None
         self._metadata_updated = False
+        self._backfill_attempted = False
         self._reconcile_warning_fingerprint_by_day: dict[date, tuple[int, float, float]] = {}
         self._current_month_mismatch_fingerprint: tuple[int, float] | None = None
         self._negative_consumption_fingerprints: set[str] = set()
@@ -1732,6 +1973,88 @@ class OctopusConsumptionStatisticsImporter:
         points.sort(key=lambda item: item[0])
         return points
 
+    @staticmethod
+    def _backfill_windows(
+        range_start: datetime,
+        range_end: datetime,
+        chunk_days: int = STATISTICS_BACKFILL_CHUNK_DAYS,
+    ) -> list[tuple[datetime, datetime]]:
+        """Split a backfill range into consecutive fetch windows."""
+        windows: list[tuple[datetime, datetime]] = []
+        cursor = range_start
+        while cursor < range_end:
+            window_end = min(cursor + timedelta(days=chunk_days), range_end)
+            windows.append((cursor, window_end))
+            cursor = window_end
+        return windows
+
+    async def _async_backfill_history(
+        self,
+        *,
+        prefix: str,
+        metadata: dict[str, Any],
+        import_start_utc: datetime,
+    ) -> tuple[datetime, float] | None:
+        """Import hourly history before the current month into a fresh series.
+
+        Only called when the statistic series is empty. Fetches up to
+        STATISTICS_BACKFILL_DAYS back in chunks (a failed chunk leaves a gap
+        rather than aborting) and imports cumulative sums starting at 0.
+        Returns (last_start, last_sum) of the imported history, or None.
+        """
+        backfill_start_day = self._local_date(import_start_utc) - timedelta(
+            days=STATISTICS_BACKFILL_DAYS
+        )
+        range_start = self._local_day_start_utc(backfill_start_day)
+        if range_start >= import_start_utc:
+            return None
+
+        values_by_start: dict[datetime, float] = {}
+        for window_start, window_end in self._backfill_windows(range_start, import_start_utc):
+            rows = await self._fetch_hourly(self._account, window_start, window_end)
+            if not rows:
+                continue
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                start_utc = self._parse_api_start(row.get("startAt"))
+                if (
+                    start_utc is None
+                    or start_utc < range_start
+                    or start_utc >= import_start_utc
+                ):
+                    continue
+                value = self._parse_non_negative_kwh(
+                    row.get("value"),
+                    prefix=prefix,
+                    label=f"backfill-hourly:{start_utc.isoformat()}",
+                )
+                if value is None:
+                    continue
+                values_by_start[start_utc] = value
+
+        if not values_by_start:
+            _LOGGER.debug("%s: backfill returned no historical rows", prefix)
+            return None
+
+        running = 0.0
+        statistics: list[dict[str, Any]] = []
+        for start_utc in sorted(values_by_start):
+            running += values_by_start[start_utc]
+            statistics.append({"start": start_utc, "state": running, "sum": running})
+
+        await self._async_add_statistics(metadata, statistics)
+        last_start = statistics[-1]["start"]
+        _LOGGER.info(
+            "%s: backfilled %s historical statistics point(s) (%s..%s, total=%.3f kWh)",
+            prefix,
+            len(statistics),
+            statistics[0]["start"].isoformat(),
+            last_start.isoformat(),
+            running,
+        )
+        return last_start, running
+
     async def _async_add_month_baseline_statistic(
         self,
         *,
@@ -1919,6 +2242,23 @@ class OctopusConsumptionStatisticsImporter:
                 "unit_class": ENERGY_UNIT_CLASS,
             }
             _LOGGER.debug("%s: filled metadata statistics metadata=%s", prefix, metadata)
+
+            # Fresh series only: import up to a year of history before the
+            # current-month import continues the sums from it. Existing
+            # series are never backfilled (their sums would be corrupted).
+            if not existing_points and not self._backfill_attempted:
+                self._backfill_attempted = True
+                backfill_result = await self._async_backfill_history(
+                    prefix=prefix,
+                    metadata=metadata,
+                    import_start_utc=import_start_utc,
+                )
+                if backfill_result is not None:
+                    baseline_start, baseline_sum = backfill_result
+                    last_start, last_sum = baseline_start, baseline_sum
+                    base_attrs["baseline_hour"] = baseline_start.isoformat()
+                    base_attrs["baseline_sum_kwh"] = round(baseline_sum, 6)
+                    base_attrs["backfilled_history"] = True
 
             fetched = await self._fetch_hourly(
                 self._account,

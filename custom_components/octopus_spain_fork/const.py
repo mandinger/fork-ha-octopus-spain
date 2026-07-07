@@ -8,6 +8,11 @@ CONF_APIKEY = "apikey"
 CONF_AUTH_TYPE: Final = "auth_type"
 UPDATE_INTERVAL = 2
 CONSUMPTION_IMPORT_DELAY_DAYS = 0
+# How much hourly history to import when the statistic series is empty
+# (fresh install). Existing series are never backfilled: inserting rows
+# below an existing cumulative-sum series would corrupt the sums.
+STATISTICS_BACKFILL_DAYS = 365
+STATISTICS_BACKFILL_CHUNK_DAYS = 30
 AUTH_OPTIONS: Final = ["username/password", "apikey"]
 
 SERVICE_DOWNLOAD_INVOICE: Final = "download_invoice"
