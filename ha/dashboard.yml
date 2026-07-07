@@ -26,37 +26,61 @@ views:
             entity: sensor.ultima_factura_octopus_a_12345678
             vertical: false
             features_position: bottom
+            grid_options:
+              columns: 12
+              rows: 1
           - type: tile
             entity: sensor.factura_a_12345678_importe_facturado
             vertical: false
             features_position: bottom
+            grid_options:
+              columns: 12
+              rows: 1
           - type: tile
             entity: sensor.factura_a_12345678_total_bruto
             vertical: false
             features_position: bottom
+            grid_options:
+              columns: 12
+              rows: 1
           - type: tile
             entity: sensor.factura_a_12345678_total_neto
             vertical: false
             features_position: bottom
+            grid_options:
+              columns: 12
+              rows: 1
           - type: tile
             entity: sensor.factura_a_12345678_impuestos
             vertical: false
             features_position: bottom
+            grid_options:
+              columns: 12
+              rows: 1
           - type: tile
             entity: sensor.factura_a_12345678_emitida
             vertical: false
             features_position: bottom
+            grid_options:
+              columns: 12
+              rows: 1
           - type: tile
             entity: sensor.factura_a_12345678_inicio_cargos
             vertical: false
             features_position: bottom
+            grid_options:
+              columns: 12
+              rows: 1
           - type: tile
             entity: sensor.factura_a_12345678_id
             vertical: false
             features_position: bottom
+            grid_options:
+              columns: 12
+              rows: 1
           - type: markdown
             grid_options:
-              columns: 6
+              columns: 12
               rows: 1.1
             content: >-
               <h3>
@@ -76,8 +100,8 @@ views:
             name: Descargar PDF
             icon: mdi:download
             grid_options:
-              columns: 6
-              rows: 1.1
+              columns: 12
+              rows: auto
             tap_action:
               action: perform-action
               perform_action: octopus_spain_fork.download_invoice
@@ -120,9 +144,15 @@ views:
           - type: tile
             entity: sensor.potencia_contratada_a_12345678
             name: Potencia contratada
+            grid_options:
+              columns: 9
+              rows: 1
           - type: tile
             entity: sensor.cups_a_12345678
             name: CUPS
+            grid_options:
+              columns: 9
+              rows: 1
       - type: grid
         column_span: 2
         cards:
@@ -151,12 +181,6 @@ views:
           - type: heading
             heading: Energía (este mes)
             icon: mdi:lightning-bolt
-          - type: tile
-            entity: sensor.consumo_ultimo_dia_a_12345678
-            name: Consumo último día
-            state_content:
-              - state
-              - Fecha
           - type: statistics-graph
             title: Consumo eléctrico
             chart_type: bar
@@ -175,3 +199,12 @@ views:
               - change
             entities:
               - octopus_spain_fork:energy_export_a_12345678
+          - type: tile
+            entity: sensor.consumo_ultimo_dia_a_12345678
+            name: Consumo último día
+            state_content:
+              - state
+              - Fecha
+            grid_options:
+              columns: 9
+              rows: 1
