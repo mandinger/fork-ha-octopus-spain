@@ -50,7 +50,13 @@ try:
     from homeassistant.components.recorder.statistics import async_update_statistics_metadata
 except ImportError:  # pragma: no cover - older Home Assistant versions
     async_update_statistics_metadata = None
-from .const import CONSUMPTION_IMPORT_DELAY_DAYS, DOMAIN, STAT_PREFIX_EXPORT
+from .const import (
+    CONSUMPTION_IMPORT_DELAY_DAYS,
+    DOMAIN,
+    STAT_PREFIX_EXPORT,
+    STATISTICS_BACKFILL_CHUNK_DAYS,
+    STATISTICS_BACKFILL_DAYS,
+)
 from .coordinator import OctopusCoordinator
 from .runtime import OctopusSpainConfigEntry
 
@@ -1299,6 +1305,7 @@ class OctopusConsumptionStatisticsImporter:
         self._log_label = log_label
         self._remove_listener: Callable[[], None] | None = None
         self._metadata_updated = False
+        self._backfill_attempted = False
         self._reconcile_warning_fingerprint_by_day: dict[date, tuple[int, float, float]] = {}
         self._current_month_mismatch_fingerprint: tuple[int, float] | None = None
         self._negative_consumption_fingerprints: set[str] = set()
@@ -1966,6 +1973,88 @@ class OctopusConsumptionStatisticsImporter:
         points.sort(key=lambda item: item[0])
         return points
 
+    @staticmethod
+    def _backfill_windows(
+        range_start: datetime,
+        range_end: datetime,
+        chunk_days: int = STATISTICS_BACKFILL_CHUNK_DAYS,
+    ) -> list[tuple[datetime, datetime]]:
+        """Split a backfill range into consecutive fetch windows."""
+        windows: list[tuple[datetime, datetime]] = []
+        cursor = range_start
+        while cursor < range_end:
+            window_end = min(cursor + timedelta(days=chunk_days), range_end)
+            windows.append((cursor, window_end))
+            cursor = window_end
+        return windows
+
+    async def _async_backfill_history(
+        self,
+        *,
+        prefix: str,
+        metadata: dict[str, Any],
+        import_start_utc: datetime,
+    ) -> tuple[datetime, float] | None:
+        """Import hourly history before the current month into a fresh series.
+
+        Only called when the statistic series is empty. Fetches up to
+        STATISTICS_BACKFILL_DAYS back in chunks (a failed chunk leaves a gap
+        rather than aborting) and imports cumulative sums starting at 0.
+        Returns (last_start, last_sum) of the imported history, or None.
+        """
+        backfill_start_day = self._local_date(import_start_utc) - timedelta(
+            days=STATISTICS_BACKFILL_DAYS
+        )
+        range_start = self._local_day_start_utc(backfill_start_day)
+        if range_start >= import_start_utc:
+            return None
+
+        values_by_start: dict[datetime, float] = {}
+        for window_start, window_end in self._backfill_windows(range_start, import_start_utc):
+            rows = await self._fetch_hourly(self._account, window_start, window_end)
+            if not rows:
+                continue
+            for row in rows:
+                if not isinstance(row, Mapping):
+                    continue
+                start_utc = self._parse_api_start(row.get("startAt"))
+                if (
+                    start_utc is None
+                    or start_utc < range_start
+                    or start_utc >= import_start_utc
+                ):
+                    continue
+                value = self._parse_non_negative_kwh(
+                    row.get("value"),
+                    prefix=prefix,
+                    label=f"backfill-hourly:{start_utc.isoformat()}",
+                )
+                if value is None:
+                    continue
+                values_by_start[start_utc] = value
+
+        if not values_by_start:
+            _LOGGER.debug("%s: backfill returned no historical rows", prefix)
+            return None
+
+        running = 0.0
+        statistics: list[dict[str, Any]] = []
+        for start_utc in sorted(values_by_start):
+            running += values_by_start[start_utc]
+            statistics.append({"start": start_utc, "state": running, "sum": running})
+
+        await self._async_add_statistics(metadata, statistics)
+        last_start = statistics[-1]["start"]
+        _LOGGER.info(
+            "%s: backfilled %s historical statistics point(s) (%s..%s, total=%.3f kWh)",
+            prefix,
+            len(statistics),
+            statistics[0]["start"].isoformat(),
+            last_start.isoformat(),
+            running,
+        )
+        return last_start, running
+
     async def _async_add_month_baseline_statistic(
         self,
         *,
@@ -2153,6 +2242,23 @@ class OctopusConsumptionStatisticsImporter:
                 "unit_class": ENERGY_UNIT_CLASS,
             }
             _LOGGER.debug("%s: filled metadata statistics metadata=%s", prefix, metadata)
+
+            # Fresh series only: import up to a year of history before the
+            # current-month import continues the sums from it. Existing
+            # series are never backfilled (their sums would be corrupted).
+            if not existing_points and not self._backfill_attempted:
+                self._backfill_attempted = True
+                backfill_result = await self._async_backfill_history(
+                    prefix=prefix,
+                    metadata=metadata,
+                    import_start_utc=import_start_utc,
+                )
+                if backfill_result is not None:
+                    baseline_start, baseline_sum = backfill_result
+                    last_start, last_sum = baseline_start, baseline_sum
+                    base_attrs["baseline_hour"] = baseline_start.isoformat()
+                    base_attrs["baseline_sum_kwh"] = round(baseline_sum, 6)
+                    base_attrs["backfilled_history"] = True
 
             fetched = await self._fetch_hourly(
                 self._account,
