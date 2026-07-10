@@ -1,6 +1,8 @@
 Fork de (https://github.com/MiguelAngelLV/ha-octopus-spain)
 # Componente Octopus Spain para Home Assistant
 
+![Downloads](https://img.shields.io/github/downloads/mandinger/fork-ha-octopus-spain/total)
+
 ## ¿Qué es Octopus Energy?
 
 [Octopus Energy](https://octopusenergy.es/) es una comercializadora eléctrica española.
