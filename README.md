@@ -1,6 +1,8 @@
 Fork de (https://github.com/MiguelAngelLV/ha-octopus-spain)
 # Componente Octopus Spain para Home Assistant
 
+[![hacs_badge](https://img.shields.io/badge/HACS-default-A855F7.svg)](https://github.com/hacs/default)
+![installation_badge](https://img.shields.io/badge/dynamic/json?color=A855F7&logo=home-assistant&label=usage&suffix=%20installs&cacheSeconds=15600&url=https://analytics.home-assistant.io/custom_integrations.json&query=%24.octopus_spain_fork.total)
 ![Downloads](https://img.shields.io/github/downloads/mandinger/fork-ha-octopus-spain/total)
 
 ## ¿Qué es Octopus Energy?
