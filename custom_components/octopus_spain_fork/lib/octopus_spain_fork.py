@@ -199,6 +199,109 @@ class OctopusSpain:
 
         return list(map(lambda a: a["number"], response["data"]["viewer"]["accounts"]))
 
+    async def account_choices(self) -> list[dict[str, Optional[str]]]:
+        """Return the user's accounts enriched with address/CUPS for the setup picker.
+
+        One round-trip fetches every account's first property address and first
+        electricity supply point (CUPS + tariff name), mirroring the
+        single-supply-point handling in ``supply_points``. Each entry has a
+        ``number`` (used as the selection value) and a human-readable ``label``.
+        Falls back to bare account numbers if the enriched query returns nulls
+        or errors, so the config flow never breaks on a partial API response.
+        """
+        if self._token is None and not await self.login():
+            _LOGGER.error("Unable to fetch account choices due to login failure")
+            return []
+
+        query = """
+            query getAccountChoices {
+              viewer {
+                accounts {
+                  ... on Account {
+                    number
+                    properties {
+                      address
+                      electricitySupplyPoints {
+                        cups
+                        activeAgreement {
+                          product {
+                            displayName
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+        """
+
+        try:
+            headers = {"authorization": self._token}
+            client = GraphqlClient(endpoint=GRAPH_QL_ENDPOINT, headers=headers)
+            response = await client.execute_async(query)
+            accounts = (
+                ((response or {}).get("data") or {}).get("viewer") or {}
+            ).get("accounts")
+            if not accounts:
+                raise OctopusApiError(_error_message(response))
+
+            choices: list[dict[str, Optional[str]]] = []
+            for account in accounts:
+                if not isinstance(account, dict):
+                    continue
+                number = account.get("number")
+                if not number:
+                    continue
+                choices.append(self._build_account_choice(number, account))
+            if not choices:
+                raise OctopusApiError("No accounts returned")
+            return choices
+        except Exception:  # noqa: BLE001 - degrade to numbers-only on any failure
+            _LOGGER.warning(
+                "Falling back to account numbers for the setup picker; "
+                "enriched account query failed",
+                exc_info=True,
+            )
+            return [{"number": number, "label": number} for number in await self.accounts()]
+
+    @staticmethod
+    def _build_account_choice(number: str, account: dict) -> dict[str, Optional[str]]:
+        """Build a picker entry from an account's first property/supply point."""
+        address: Optional[str] = None
+        cups: Optional[str] = None
+        product: Optional[str] = None
+        for prop in account.get("properties") or []:
+            if not isinstance(prop, dict):
+                continue
+            if address is None:
+                address = prop.get("address")
+            points = [p for p in (prop.get("electricitySupplyPoints") or []) if isinstance(p, dict)]
+            if points:
+                supply_point = points[0]
+                cups = supply_point.get("cups")
+                agreement = supply_point.get("activeAgreement") or {}
+                product = (agreement.get("product") or {}).get("displayName")
+                address = prop.get("address") or address
+                break
+
+        label_parts = [number]
+        if address:
+            label_parts.append(address)
+        if cups:
+            label_parts.append(f"CUPS {cups}")
+        label = " · ".join(label_parts)
+        if product:
+            label = f"{label} ({product})"
+
+        return {
+            "number": number,
+            "label": label,
+            "address": address,
+            "cups": cups,
+            "product": product,
+        }
+
     async def hourly_consumption(
         self,
         account: str,

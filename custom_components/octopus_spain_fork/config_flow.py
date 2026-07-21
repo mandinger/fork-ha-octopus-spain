@@ -8,6 +8,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.selector import (
     SelectSelector,
     SelectSelectorConfig,
@@ -19,6 +20,7 @@ from homeassistant.helpers.selector import (
 
 from .const import (
     AUTH_OPTIONS,
+    CONF_ACCOUNTS,
     CONF_APIKEY,
     CONF_AUTH_TYPE,
     CONF_EMAIL,
@@ -102,6 +104,19 @@ def _generated_api_key_schema(default: str | None = None) -> vol.Schema:
     return vol.Schema({key: API_KEY_SELECTOR})
 
 
+def _accounts_schema(
+    choices: list[dict[str, Any]], selected: list[str] | None
+) -> vol.Schema:
+    """Build a checkbox list of accounts, defaulting to the selected set (or all)."""
+    options = {choice["number"]: choice.get("label") or choice["number"] for choice in choices}
+    default = [number for number in (selected or list(options)) if number in options]
+    if not default:
+        default = list(options)
+    return vol.Schema(
+        {vol.Required(CONF_ACCOUNTS, default=default): cv.multi_select(options)}
+    )
+
+
 class PlaceholderHub:
     def __init__(self, email: str, password: str) -> None:
         """Initialize."""
@@ -115,6 +130,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._auth_type: str | None = None
         self._cached_data: dict[str, Any] = {}
+        self._account_choices: list[dict[str, Any]] = []
+        self._auth_data: dict[str, Any] = {}
 
     @staticmethod
     @callback
@@ -150,7 +167,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._cached_data[CONF_APIKEY] = apikey
         self._cached_data.setdefault(CONF_EMAIL, None)
         self._cached_data.setdefault(CONF_PASSWORD, None)
-        return await self._validate_and_create_entry(schema, "apikey")
+        return await self._validate_and_discover(schema, "apikey")
 
     async def async_step_credentials(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         email_default = self._cached_data.get(CONF_EMAIL)
@@ -186,7 +203,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._cached_data[CONF_AUTH_TYPE] = AUTH_TYPE_APIKEY
             return await self.async_step_generated_apikey()
 
-        return await self._validate_and_create_entry(schema, "credentials")
+        return await self._validate_and_discover(schema, "credentials")
 
     async def async_step_generated_apikey(
         self, user_input: dict[str, Any] | None = None
@@ -201,28 +218,54 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._cached_data[CONF_AUTH_TYPE] = AUTH_TYPE_APIKEY
         self._cached_data[CONF_EMAIL] = None
         self._cached_data[CONF_PASSWORD] = None
-        return await self._validate_and_create_entry(schema, "generated_apikey")
+        return await self._validate_and_discover(schema, "generated_apikey")
 
-    async def _validate_and_create_entry(self, schema: vol.Schema, step_id: str) -> FlowResult:
+    async def _validate_and_discover(self, schema: vol.Schema, step_id: str) -> FlowResult:
         auth_type = self._cached_data.get(CONF_AUTH_TYPE, AUTH_TYPE_CREDENTIALS)
         email = self._cached_data.get(CONF_EMAIL)
         password = self._cached_data.get(CONF_PASSWORD)
         apikey = self._cached_data.get(CONF_APIKEY)
 
         api = OctopusSpain(email, password, apikey)
-        if await api.login():
-            data = {
-                CONF_AUTH_TYPE: auth_type,
-                CONF_EMAIL: email,
-                CONF_PASSWORD: password,
-                CONF_APIKEY: apikey,
-            }
-            return self.async_create_entry(data=data, title="Octopus Spain")
+        if not await api.login():
+            return self.async_show_form(
+                step_id=step_id,
+                data_schema=schema,
+                errors={"base": "invalid_auth"},
+            )
 
-        return self.async_show_form(
-            step_id=step_id,
-            data_schema=schema,
-            errors={"base": "invalid_auth"},
+        self._auth_data = {
+            CONF_AUTH_TYPE: auth_type,
+            CONF_EMAIL: email,
+            CONF_PASSWORD: password,
+            CONF_APIKEY: apikey,
+        }
+        # Discover the account(s) so the user can choose which ones to load.
+        self._account_choices = await api.account_choices()
+        if len(self._account_choices) <= 1:
+            # Nothing to choose: load the single account (or all, if none).
+            selected = [choice["number"] for choice in self._account_choices]
+            return self.async_create_entry(
+                data={**self._auth_data, CONF_ACCOUNTS: selected},
+                title="Octopus Spain",
+            )
+        return await self.async_step_accounts()
+
+    async def async_step_accounts(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        schema = _accounts_schema(self._account_choices, None)
+        if user_input is None:
+            return self.async_show_form(step_id="accounts", data_schema=schema)
+
+        selected = user_input[CONF_ACCOUNTS]
+        if not selected:
+            return self.async_show_form(
+                step_id="accounts",
+                data_schema=schema,
+                errors={"base": "no_accounts_selected"},
+            )
+        return self.async_create_entry(
+            data={**self._auth_data, CONF_ACCOUNTS: selected},
+            title="Octopus Spain",
         )
 
 
@@ -234,7 +277,10 @@ class OptionFlowHandler(config_entries.OptionsFlow):
             CONF_EMAIL: base.get(CONF_EMAIL),
             CONF_PASSWORD: base.get(CONF_PASSWORD),
             CONF_APIKEY: base.get(CONF_APIKEY),
+            CONF_ACCOUNTS: base.get(CONF_ACCOUNTS),
         }
+        self._account_choices: list[dict[str, Any]] = []
+        self._auth_data: dict[str, Any] = {}
 
     async def async_step_init(self, user_input=None):
         auth_default = self._cached_data.get(CONF_AUTH_TYPE)
@@ -258,7 +304,7 @@ class OptionFlowHandler(config_entries.OptionsFlow):
         self._cached_data[CONF_APIKEY] = user_input[CONF_APIKEY]
         self._cached_data[CONF_EMAIL] = None
         self._cached_data[CONF_PASSWORD] = None
-        return await self._validate_and_save(schema, "apikey")
+        return await self._validate_and_discover(schema, "apikey")
 
     async def async_step_credentials(self, user_input=None):
         email_default = self._cached_data.get(CONF_EMAIL)
@@ -270,27 +316,49 @@ class OptionFlowHandler(config_entries.OptionsFlow):
         self._cached_data[CONF_EMAIL] = user_input[CONF_EMAIL]
         self._cached_data[CONF_PASSWORD] = user_input[CONF_PASSWORD]
         self._cached_data[CONF_APIKEY] = None
-        return await self._validate_and_save(schema, "credentials")
+        return await self._validate_and_discover(schema, "credentials")
 
-    async def _validate_and_save(self, schema: vol.Schema, step_id: str) -> FlowResult:
+    async def _validate_and_discover(self, schema: vol.Schema, step_id: str) -> FlowResult:
         auth_type = self._cached_data.get(CONF_AUTH_TYPE, AUTH_TYPE_CREDENTIALS)
         email = self._cached_data.get(CONF_EMAIL)
         password = self._cached_data.get(CONF_PASSWORD)
         apikey = self._cached_data.get(CONF_APIKEY)
 
         api = OctopusSpain(email, password, apikey)
-        if await api.login():
-            data = {
-                CONF_AUTH_TYPE: auth_type,
-                CONF_EMAIL: email,
-                CONF_PASSWORD: password,
-                CONF_APIKEY: apikey,
-            }
-            return self.async_create_entry(title="", data=data)
+        if not await api.login():
+            return self.async_show_form(
+                step_id=step_id,
+                data_schema=schema,
+                errors={"base": "invalid_auth"},
+            )
 
-        return self.async_show_form(
-            step_id=step_id,
-            data_schema=schema,
-            errors={"base": "invalid_auth"},
+        self._auth_data = {
+            CONF_AUTH_TYPE: auth_type,
+            CONF_EMAIL: email,
+            CONF_PASSWORD: password,
+            CONF_APIKEY: apikey,
+        }
+        self._account_choices = await api.account_choices()
+        if len(self._account_choices) <= 1:
+            selected = [choice["number"] for choice in self._account_choices]
+            return self.async_create_entry(
+                title="", data={**self._auth_data, CONF_ACCOUNTS: selected}
+            )
+        return await self.async_step_accounts()
+
+    async def async_step_accounts(self, user_input=None):
+        schema = _accounts_schema(self._account_choices, self._cached_data.get(CONF_ACCOUNTS))
+        if user_input is None:
+            return self.async_show_form(step_id="accounts", data_schema=schema)
+
+        selected = user_input[CONF_ACCOUNTS]
+        if not selected:
+            return self.async_show_form(
+                step_id="accounts",
+                data_schema=schema,
+                errors={"base": "no_accounts_selected"},
+            )
+        return self.async_create_entry(
+            title="", data={**self._auth_data, CONF_ACCOUNTS: selected}
         )
 

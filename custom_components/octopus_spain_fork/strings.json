@@ -26,12 +26,19 @@
           "apikey": "API key"
         },
         "description": "Your new API key is shown below and pre-filled so you can copy it. This is the only time it can be viewed."
+      },
+      "accounts": {
+        "data": {
+          "accounts": "Subscriptions"
+        },
+        "description": "Select which subscriptions to load. All are selected by default; uncheck any you don't want."
       }
     },
     "error": {
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
       "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
       "cannot_generate_apikey": "Unable to generate an API key",
+      "no_accounts_selected": "Select at least one subscription.",
       "unknown": "[%key:common::config_flow::error::unknown%]"
     },
     "abort": {
@@ -55,7 +62,16 @@
           "email": "[%key:common::config_flow::data::username%]",
           "password": "[%key:common::config_flow::data::password%]"
         }
+      },
+      "accounts": {
+        "data": {
+          "accounts": "Subscriptions"
+        },
+        "description": "Select which subscriptions to load. Unchecking a subscription removes its entities."
       }
+    },
+    "error": {
+      "no_accounts_selected": "Select at least one subscription."
     }
   },
   "services": {

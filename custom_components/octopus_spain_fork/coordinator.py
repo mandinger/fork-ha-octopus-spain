@@ -41,7 +41,14 @@ def _invoice_pdf_needs_refresh(invoice: dict[str, Any] | None) -> bool:
 class OctopusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """DataUpdateCoordinator for Octopus Spain accounts."""
 
-    def __init__(self, hass: HomeAssistant, email: str | None, password: str | None, api_key: str | None) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        email: str | None,
+        password: str | None,
+        api_key: str | None,
+        selected_accounts: list[str] | None = None,
+    ) -> None:
         super().__init__(
             hass=hass,
             logger=_LOGGER,
@@ -51,12 +58,21 @@ class OctopusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._api = OctopusSpain(email, password, api_key)
         self._data: dict[str, Any] = {}
         self._invoice_refreshing_accounts: set[str] = set()
+        # Accounts the user chose to load; None/empty means "load them all".
+        self._selected_accounts: set[str] | None = (
+            set(selected_accounts) if selected_accounts else None
+        )
+        # Every account discovered on the last refresh (before filtering); used
+        # by the sensor platform to clean up entities for deselected accounts.
+        self.all_accounts: list[str] = []
         self.pdf_manager = InvoicePdfManager(hass)
 
     async def _async_update_data(self) -> dict[str, Any]:
         if await self._api.login():
             self._data = {}
-            accounts = await self._api.accounts()
+            all_accounts = await self._api.accounts()
+            self.all_accounts = all_accounts
+            accounts = self._select_accounts(all_accounts, self._selected_accounts)
             for account in accounts:
                 acc = await self._api.account(account)
                 # Download the PDF right away, while the presigned URL is fresh.
@@ -80,6 +96,21 @@ class OctopusCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
                 self._data[account] = acc
         return self._data
+
+    @staticmethod
+    def _select_accounts(
+        all_accounts: list[str], selected: set[str] | None
+    ) -> list[str]:
+        """Keep only the user-selected accounts, preserving discovery order.
+
+        ``None`` means "no filter configured" → load every account (backward
+        compatible with entries created before subscription selection existed).
+        """
+        return [
+            account
+            for account in all_accounts
+            if selected is None or account in selected
+        ]
 
     async def _async_seed_hourly(self, account: str, fetcher) -> list[dict[str, Any]]:
         """Fetch the initial small window of hourly measurements."""

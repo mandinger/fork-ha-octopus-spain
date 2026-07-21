@@ -134,6 +134,72 @@ def _remove_legacy_consumption_entities(
             )
 
 
+def _config_entry_entities(
+    registry: er.EntityRegistry,
+    entry: OctopusSpainConfigEntry,
+) -> list[Any]:
+    """Return this config entry's entity-registry entries (version-tolerant)."""
+    entries_for_config_entry = getattr(er, "async_entries_for_config_entry", None)
+    if entries_for_config_entry is not None:
+        return entries_for_config_entry(registry, entry.entry_id)
+    # pragma: no cover - compatibility with older Home Assistant versions
+    return [
+        entity_entry
+        for entity_entry in registry.entities.values()
+        if entity_entry.config_entry_id == entry.entry_id
+    ]
+
+
+def _account_for_unique_id(unique_id: str, slug_by_account: dict[str, str]) -> str | None:
+    """Map an account-scoped unique_id back to its account.
+
+    Every unique_id ends with ``_{account_slug}``. Slugs can themselves contain
+    underscores (e.g. ``a_1234abcd``), so a shorter account's slug can be a
+    suffix of a longer account's unique_id. Pick the longest matching slug to
+    resolve that ambiguity.
+    """
+    best_account: str | None = None
+    best_len = -1
+    for account, slug in slug_by_account.items():
+        if (unique_id == slug or unique_id.endswith(f"_{slug}")) and len(slug) > best_len:
+            best_len = len(slug)
+            best_account = account
+    return best_account
+
+
+def _remove_deselected_account_entities(
+    hass: HomeAssistant,
+    entry: OctopusSpainConfigEntry,
+    all_accounts: list[str],
+    kept_accounts: list[str],
+) -> None:
+    """Remove registry entities for accounts the user deselected.
+
+    Only the entities are removed; imported long-term statistics (keyed by
+    statistic_id in the recorder, not the entity registry) are left intact so
+    energy history survives if the account is later re-selected.
+    """
+    kept = set(kept_accounts)
+    deselected = {account for account in all_accounts if account not in kept}
+    if not deselected:
+        return
+
+    registry = er.async_get(hass)
+    slug_by_account = {account: _account_slug(account) for account in all_accounts}
+    for entity_entry in _config_entry_entities(registry, entry):
+        if entity_entry.domain != "sensor":
+            continue
+        account = _account_for_unique_id(entity_entry.unique_id, slug_by_account)
+        if account in deselected:
+            registry.async_remove(entity_entry.entity_id)
+            _LOGGER.info(
+                "Removed entity %s (%s) for deselected account %s",
+                entity_entry.entity_id,
+                entity_entry.unique_id,
+                account,
+            )
+
+
 def _coerce_date(raw: Any) -> date | None:
     """Coerce an API value (date/datetime/ISO string) into a date."""
     if isinstance(raw, datetime):
@@ -181,6 +247,9 @@ async def async_setup_entry(
     sensors = []
     accounts = list(coordinator.data)
     _remove_legacy_consumption_entities(hass, entry, accounts)
+    # Drop entities for accounts the user deselected (in the initial flow or
+    # later via Options), keeping only the accounts that survived filtering.
+    _remove_deselected_account_entities(hass, entry, coordinator.all_accounts, accounts)
     single_account = len(accounts) == 1
     for account in accounts:
         # Wallets

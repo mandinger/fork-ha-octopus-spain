@@ -5,7 +5,8 @@
     },
     "error": {
       "invalid_auth": "Las credenciales o la API key no son válidas.",
-      "cannot_generate_apikey": "No se pudo generar una API key con estas credenciales."
+      "cannot_generate_apikey": "No se pudo generar una API key con estas credenciales.",
+      "no_accounts_selected": "Selecciona al menos una suscripción."
     },
     "step": {
       "user": {
@@ -37,12 +38,20 @@
           "apikey": "API key"
         },
         "description": "Tu nueva API key se muestra abajo y queda precargada para que puedas copiarla. Esta es la única vez que podrá visualizarse."
+      },
+      "accounts": {
+        "title": "Suscripciones",
+        "data": {
+          "accounts": "Suscripciones"
+        },
+        "description": "Selecciona qué suscripciones cargar. Todas están seleccionadas por defecto; desmarca las que no quieras."
       }
     }
   },
   "options": {
     "error": {
-      "invalid_auth": "Las credenciales o la API key no son válidas."
+      "invalid_auth": "Las credenciales o la API key no son válidas.",
+      "no_accounts_selected": "Selecciona al menos una suscripción."
     },
     "step": {
       "init": {
@@ -63,6 +72,13 @@
           "email": "Email",
           "password": "Contraseña"
         }
+      },
+      "accounts": {
+        "title": "Suscripciones",
+        "data": {
+          "accounts": "Suscripciones"
+        },
+        "description": "Selecciona qué suscripciones cargar. Desmarcar una suscripción elimina sus entidades."
       }
     }
   },
