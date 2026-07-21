@@ -6,6 +6,9 @@ CONF_EMAIL = "email"
 CONF_PASSWORD = "password"
 CONF_APIKEY = "apikey"
 CONF_AUTH_TYPE: Final = "auth_type"
+# List of Octopus account numbers the user chose to load entities for. When
+# missing or empty, every discovered account is loaded (backward compatible).
+CONF_ACCOUNTS: Final = "accounts"
 UPDATE_INTERVAL = 2
 CONSUMPTION_IMPORT_DELAY_DAYS = 0
 # How much hourly history to import when the statistic series is empty

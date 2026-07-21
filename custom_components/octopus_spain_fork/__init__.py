@@ -12,6 +12,7 @@ from homeassistant.helpers import config_validation as cv
 
 from .const import (
     ATTR_ACCOUNT,
+    CONF_ACCOUNTS,
     CONF_APIKEY,
     CONF_EMAIL,
     CONF_PASSWORD,
@@ -65,6 +66,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: OctopusSpainConfigEntry)
         email=entry_data.get(CONF_EMAIL),
         password=entry_data.get(CONF_PASSWORD),
         api_key=entry_data.get(CONF_APIKEY),
+        selected_accounts=entry_data.get(CONF_ACCOUNTS),
     )
     entry.runtime_data = OctopusSpainRuntimeData(coordinator=coordinator)
 

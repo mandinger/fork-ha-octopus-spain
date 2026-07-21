@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from custom_components.octopus_spain_fork.sensor import (
     OctopusConsumptionStatisticsImporter,
+    _account_for_unique_id,
     _last_day_consumption,
     _tariff_period_prices,
 )
@@ -30,6 +31,16 @@ def test_tariff_period_prices_rejects_non_three_period():
     assert _tariff_period_prices(_contract(None, None)) is None
     assert _tariff_period_prices(None) is None
     assert _tariff_period_prices({}) is None
+
+
+def test_account_for_unique_id_prefers_longest_slug():
+    """When one account's slug is a suffix of another's, the longest wins."""
+    slug_by_account = {"1234": "1234", "A_1234": "a_1234"}
+    # "solar_wallet_a_1234" ends with both "_1234" and "_a_1234"; the longer wins.
+    assert _account_for_unique_id("solar_wallet_a_1234", slug_by_account) == "A_1234"
+    # An id that only ends with the shorter slug resolves to that account.
+    assert _account_for_unique_id("octopus_credit_1234", slug_by_account) == "1234"
+    assert _account_for_unique_id("no_match_here", slug_by_account) is None
 
 
 def _row(day: int, hour: int, value) -> dict:

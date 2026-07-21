@@ -156,3 +156,59 @@ async def test_payment_forecast_kt_ct_3949_returns_none(monkeypatch):
         ),
     )
     assert await _api().payment_forecast("A-1") is None
+
+
+def _choices_response(accounts: list[dict]) -> dict:
+    """Build a getAccountChoices response from raw account nodes."""
+    return {"data": {"viewer": {"accounts": accounts}}}
+
+
+async def test_account_choices_builds_rich_labels(monkeypatch):
+    """account_choices() labels an account with its number, address and CUPS."""
+    response = _choices_response(
+        [
+            {
+                "number": "A-1234ABCD",
+                "properties": [
+                    {
+                        "address": "Calle Falsa 123",
+                        "electricitySupplyPoints": [
+                            {
+                                "cups": "ES0031000000000000AB",
+                                "activeAgreement": {"product": {"displayName": "Octopus Relax"}},
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    )
+    _patch(monkeypatch, _FakeClient(response))
+    choices = await _api().account_choices()
+    assert choices[0]["number"] == "A-1234ABCD"
+    assert choices[0]["label"] == (
+        "A-1234ABCD · Calle Falsa 123 · CUPS ES0031000000000000AB (Octopus Relax)"
+    )
+
+
+async def test_account_choices_falls_back_to_number_when_no_details(monkeypatch):
+    """An account with no property details is labelled with just its number."""
+    _patch(monkeypatch, _FakeClient(_choices_response([{"number": "B-99", "properties": []}])))
+    choices = await _api().account_choices()
+    assert choices == [
+        {"number": "B-99", "label": "B-99", "address": None, "cups": None, "product": None}
+    ]
+
+
+async def test_account_choices_falls_back_to_numbers_on_error(monkeypatch):
+    """A null/error enriched response degrades to bare account numbers (issue #29)."""
+    client = _SeqClient(
+        [
+            {"errors": [{"message": "boom"}]},
+            {"data": {"viewer": {"accounts": [{"number": "A-1"}, {"number": "A-2"}]}}},
+        ]
+    )
+    _patch(monkeypatch, client)
+    choices = await _api().account_choices()
+    assert [c["number"] for c in choices] == ["A-1", "A-2"]
+    assert [c["label"] for c in choices] == ["A-1", "A-2"]
