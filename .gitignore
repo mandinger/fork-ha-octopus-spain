@@ -3,3 +3,4 @@ __pycache__
 .claude/settings.json
 .venv/
 coverage.xml
+CLAUDE.md
