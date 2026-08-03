@@ -11,6 +11,13 @@ CONF_AUTH_TYPE: Final = "auth_type"
 CONF_ACCOUNTS: Final = "accounts"
 UPDATE_INTERVAL = 2
 CONSUMPTION_IMPORT_DELAY_DAYS = 0
+# The statistics importer reconstructs a rolling window that normally starts at
+# the first of the current month. Distributor readings land 1-3 days late, so on
+# the 1st the tail of the previous month is still unpublished; without a
+# catch-up the window would move on and those days would never be imported
+# again. During the first CONSUMPTION_CATCHUP_DAYS days of a month the window is
+# extended back into the previous month so late data still gets picked up.
+CONSUMPTION_CATCHUP_DAYS: Final = 7
 # How much hourly history to import when the statistic series is empty
 # (fresh install). Existing series are never backfilled: inserting rows
 # below an existing cumulative-sum series would corrupt the sums.

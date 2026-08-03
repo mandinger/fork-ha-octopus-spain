@@ -118,9 +118,10 @@ El componente no ofrece consumo en tiempo real. En su lugar, importa de forma re
 
 - Fuente: datos horarios (hourly) de consumo por cuenta.
 - Funcionamiento: en cada actualización se vuelve a consultar el mes natural en curso, usando la zona horaria de Home Assistant, y se reimportan las estadísticas horarias acumuladas en un único `statistic_id` externo estable. Esto permite corregir horas que Octopus publica con retraso o que aparecen días después.
+- Cambio de mes: durante los primeros 7 días de cada mes la ventana se amplía hacia atrás hasta 7 días, de modo que las lecturas de los últimos días del mes anterior (que la distribuidora suele publicar con 1-3 días de retraso) se siguen importando en lugar de perderse al cambiar el mes.
 - Si Octopus todavía no ha publicado datos horarios del mes, se crea una estadística base con el total acumulado anterior para que el Panel de Energía pueda reconocer la estadística.
 - Backfill inicial: en instalaciones nuevas (sin estadísticas previas) se importan hasta 365 días de histórico horario en bloques de 30 días. Las series existentes no se modifican.
-- Diagnóstico: la entidad incluye atributos como `current_month_imported_total_kwh`, `api_data_through`, `hours_not_yet_available`, `current_month_api_hourly_rows`, `current_month_hourly_rows` y `current_month_zero_filled_hours` para comprobar hasta qué hora ha devuelto datos la API.
+- Diagnóstico: la entidad incluye atributos como `current_month_imported_total_kwh`, `api_data_through`, `hours_not_yet_available`, `current_month_api_hourly_rows`, `current_month_hourly_rows`, `current_month_zero_filled_hours` e `import_window_start_utc` para comprobar hasta qué hora ha devuelto datos la API y qué ventana se está reimportando.
 - Tipo de dato: estadística externa con suma acumulada por hora.
 - Unidad: kWh.
 - Identificador de estadística (`statistic_id`): `octopus_spain_fork:energy_consumption_<cuenta_slug>`.
