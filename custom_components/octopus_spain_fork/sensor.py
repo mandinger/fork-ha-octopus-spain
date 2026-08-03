@@ -51,6 +51,7 @@ try:
 except ImportError:  # pragma: no cover - older Home Assistant versions
     async_update_statistics_metadata = None
 from .const import (
+    CONSUMPTION_CATCHUP_DAYS,
     CONSUMPTION_IMPORT_DELAY_DAYS,
     DOMAIN,
     STAT_PREFIX_EXPORT,
@@ -1913,12 +1914,29 @@ class OctopusConsumptionStatisticsImporter:
         return dt_util.as_utc(parsed)
 
     @staticmethod
-    def _month_import_window(now_utc: datetime) -> tuple[datetime, datetime]:
-        """Return the Home Assistant-local current month import window in UTC."""
+    def _current_month_start(now_utc: datetime) -> datetime:
+        """Return the Home Assistant-local start of the current month in UTC."""
+        month_start_local = dt_util.as_local(now_utc).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        return dt_util.as_utc(month_start_local)
+
+    @staticmethod
+    def _import_window(now_utc: datetime) -> tuple[datetime, datetime]:
+        """Return the Home Assistant-local import window in UTC.
+
+        The window normally spans the current month, but keeps reaching
+        CONSUMPTION_CATCHUP_DAYS back into the previous month so readings the
+        distributor publishes after the month rolls over are still imported.
+        """
         now_local = dt_util.as_local(now_utc)
         month_start_local = now_local.replace(
             day=1, hour=0, minute=0, second=0, microsecond=0
         )
+        catchup_start_local = (now_local - timedelta(days=CONSUMPTION_CATCHUP_DAYS)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        import_start_local = min(month_start_local, catchup_start_local)
         if CONSUMPTION_IMPORT_DELAY_DAYS <= 0:
             import_end_local = (now_local + timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0
@@ -1927,9 +1945,9 @@ class OctopusConsumptionStatisticsImporter:
             import_end_local = (now_local - timedelta(days=CONSUMPTION_IMPORT_DELAY_DAYS)).replace(
                 hour=0, minute=0, second=0, microsecond=0
             )
-        if import_end_local < month_start_local:
-            import_end_local = month_start_local
-        return dt_util.as_utc(month_start_local), dt_util.as_utc(import_end_local)
+        if import_end_local < import_start_local:
+            import_end_local = import_start_local
+        return dt_util.as_utc(import_start_local), dt_util.as_utc(import_end_local)
 
     def _local_day_hour_starts(self, day: date) -> list[datetime]:
         """Return expected hourly interval starts for a local day in UTC."""
@@ -1943,8 +1961,14 @@ class OctopusConsumptionStatisticsImporter:
         *,
         prefix: str,
         measurements_by_start: dict[datetime, float],
+        blocking_from_day: date | None = None,
     ) -> tuple[dict[datetime, float], date | None]:
-        """Skip the first incomplete local day and every day after it."""
+        """Skip the first incomplete local day and every day after it.
+
+        Days before ``blocking_from_day`` are the month-boundary catch-up tail:
+        an incomplete one is dropped on its own instead of truncating, so a
+        previous month that never got completed cannot block the current one.
+        """
         if not measurements_by_start:
             return measurements_by_start, None
 
@@ -1968,6 +1992,19 @@ class OctopusConsumptionStatisticsImporter:
                     prefix,
                     len(missing_starts),
                     day.isoformat(),
+                )
+                continue
+
+            if blocking_from_day is not None and day < blocking_from_day:
+                # Catch-up tail: import the hours we do have. Whatever is still
+                # missing arrives on a later run, and the cumulative-sum
+                # mismatch check re-imports the corrected sums then.
+                _LOGGER.debug(
+                    "%s: incomplete catch-up day %s (hours_seen=%s/%s); keeping it without truncating later days",
+                    prefix,
+                    day.isoformat(),
+                    len(expected_starts) - len(missing_starts),
+                    len(expected_starts),
                 )
                 continue
 
@@ -2241,7 +2278,8 @@ class OctopusConsumptionStatisticsImporter:
             await self._async_update_statistics_metadata()
 
             now_utc = dt_util.utcnow()
-            import_start_utc, import_end_utc = self._month_import_window(now_utc)
+            import_start_utc, import_end_utc = self._import_window(now_utc)
+            month_start_utc = self._current_month_start(now_utc)
             stats_window_hours = max(
                 1,
                 int((import_end_utc - import_start_utc).total_seconds() // 3600) + 96,
@@ -2291,8 +2329,10 @@ class OctopusConsumptionStatisticsImporter:
                 "statistic_id": self._statistic_id,
                 "current_month_start": dt_util.as_local(import_start_utc).isoformat(),
                 "current_month_start_utc": import_start_utc.isoformat(),
+                "import_window_start_utc": import_start_utc.isoformat(),
                 "import_window_end_utc": import_end_utc.isoformat(),
                 "import_delay_days": CONSUMPTION_IMPORT_DELAY_DAYS,
+                "catchup_days": CONSUMPTION_CATCHUP_DAYS,
                 "baseline_hour": baseline_start.isoformat() if baseline_start else None,
                 "baseline_sum_kwh": round(baseline_sum, 6),
                 "previous_last_imported_hour": last_start.isoformat() if last_start else None,
@@ -2445,6 +2485,7 @@ class OctopusConsumptionStatisticsImporter:
             api_measurements_by_start, truncated_from_day = self._truncate_incomplete_days(
                 prefix=prefix,
                 measurements_by_start=api_measurements_by_start,
+                blocking_from_day=self._local_date(month_start_utc),
             )
             if truncated_from_day is not None:
                 preserved_existing_values_by_start = {
