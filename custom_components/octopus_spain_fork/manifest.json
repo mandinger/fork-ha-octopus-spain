@@ -8,5 +8,5 @@
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/mandinger/fork-ha-octopus-spain/issues",
   "requirements": ["python-graphql-client==0.4.3", "tariff-td==1.1"],
-  "version": "v20260707.2"
+  "version": "v20260803.1"
 }
